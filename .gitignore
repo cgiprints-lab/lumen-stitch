@@ -4,3 +4,6 @@ build/
 adapters/*/mod/dusklight/
 .stamp
 *.dusk.bak-*
+# integration bundles downloaded from CI (not source)
+adapters/*/artifacts/
+
