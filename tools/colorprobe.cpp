@@ -63,6 +63,62 @@ void report(const char* name, Stats& s) {
         100.0 * (s.n - low) / s.n);
 }
 
+// Fit A -> B as a per-channel transfer curve, distribution-wise: for a set of
+// quantiles of A's sorted values, print B's value at the same quantile, plus a
+// least-squares fit of the two most likely models (power B = A^e, and gain
+// B = A*g). Intended for a same-scene pair: a Lumen capture and a Print Screen
+// of the very same frame.
+void fit_curve(const char* name_a, const char* name_b, const std::vector<unsigned char> a[3],
+    const std::vector<unsigned char> b[3]) {
+    std::printf("fit %s -> %s\n", name_a, name_b);
+    double exp_num = 0, exp_den = 0, gain_num = 0, gain_den = 0;
+    int samples = 0;
+    for (int c = 0; c < 3; ++c) {
+        if (a[c].size() != b[c].size()) {
+            std::printf("  %s: size mismatch (%zu vs %zu)\n", "c", a[c].size(), b[c].size());
+            continue;
+        }
+        std::vector<unsigned char> sa = a[c], sb = b[c];
+        std::sort(sa.begin(), sa.end());
+        std::sort(sb.begin(), sb.end());
+        std::printf("  ch%d deciles A->B:", c);
+        for (int q = 5; q <= 95; q += 10) {
+            const size_t i = size_t(q / 100.0 * double(sa.size() - 1));
+            std::printf(" %.2f->%.2f", sa[i] / 255.0, sb[i] / 255.0);
+            const double x = sa[i] / 255.0, y = sb[i] / 255.0;
+            if (x > 0.02 && y > 0.02) {
+                exp_num += std::log(y) * std::log(x);
+                exp_den += std::log(x) * std::log(x);
+                gain_num += y * x;
+                gain_den += x * x;
+                ++samples;
+            }
+        }
+        std::printf("\n");
+    }
+    if (samples) {
+        std::printf("  models: B = A^%.3f   |   B = A*%.3f   (%d sample points)\n",
+            exp_num / exp_den, gain_num / gain_den, samples);
+    }
+}
+
+bool load_cols(const std::string& path, std::vector<unsigned char> cols[3]) {
+    int w = 0, h = 0, ch = 0;
+    unsigned char* px = stbi_load(path.c_str(), &w, &h, &ch, 3);
+    if (!px) {
+        std::printf("%s: load failed (%s)\n", path.c_str(), stbi_failure_reason());
+        return false;
+    }
+    const size_t n = size_t(w) * size_t(h);
+    for (int c = 0; c < 3; ++c) {
+        cols[c].resize(n);
+        for (size_t i = 0; i < n; ++i)
+            cols[c][i] = px[i * 3 + c];
+    }
+    stbi_image_free(px);
+    return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -70,6 +126,7 @@ int main(int argc, char** argv) {
     Mode mode = MODE_NONE;
     double param = 2.2;
     std::string save;
+    std::string fit;
     double center = 0.0;
     std::vector<std::string> files;
     for (int i = 1; i < argc; ++i) {
@@ -86,12 +143,14 @@ int main(int argc, char** argv) {
             center = std::atof(argv[++i]);
         else if (a == "--save" && i + 1 < argc)
             save = argv[++i];
+        else if (a == "--fit" && i + 1 < argc)
+            fit = argv[++i];
         else
             files.push_back(a);
     }
     if (files.empty()) {
         std::printf("usage: colorprobe img... [--srgb|--srgbdec|--gamma f|--gain f] "
-                    "[--center frac] [--save out.png]\n");
+                    "[--center frac] [--save out.png] [--fit ref.png]\n");
         return 2;
     }
 
@@ -163,6 +222,12 @@ int main(int argc, char** argv) {
         }
         stbi_image_free(px);
         px = nullptr;
+    }
+
+    if (!fit.empty() && !files.empty()) {
+        std::vector<unsigned char> ca[3], cb[3];
+        if (load_cols(files[0], ca) && load_cols(fit, cb))
+            fit_curve(files[0].c_str(), fit.c_str(), ca, cb);
     }
     return 0;
 }

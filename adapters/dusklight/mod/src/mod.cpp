@@ -1616,10 +1616,19 @@ HookAction on_stage_change_pre(ModContext*, void*, void*, void*) {
     return HOOK_CONTINUE;
 }
 
+// dusk::game_clock::advance() returns const FrameTiming& - a pointer in the x64
+// ABI - and the SDK trampoline declares its return slot with the type we
+// declared (void*), so retval here points at that slot, not at the struct. The
+// first version of this hook cast retval directly, which wrote past an 8-byte
+// stack slot: the freeze silently did nothing (and writing at offset 0 would
+// have corrupted the returned pointer itself).
 void on_advance_post(ModContext*, void*, void* retval, void*) {
     if (!g_photo.active || !g_photo.frozen || !retval)
         return;
-    auto* timing = static_cast<FrameTimingMirror*>(retval);
+    auto** slot = static_cast<void**>(retval);
+    auto* timing = static_cast<FrameTimingMirror*>(*slot);
+    if (!timing || reinterpret_cast<uintptr_t>(timing) < 0x10000)
+        return;
     timing->numSimTicks = 0;
     // Also stop the clock itself: dt drives interpolation, particle/texture
     // animation and UI motion, all of which keep running on a tick-only freeze.
