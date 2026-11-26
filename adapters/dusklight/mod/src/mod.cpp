@@ -140,8 +140,22 @@ struct CaptureState {
     uint32_t uniform_offset = 0;   // dims slot inside the frame uniform stream
     // Persistent pipeline.
     WGPUComputePipeline pipeline = nullptr;
+    bool map_failed = false;       // set by the map callback on non-Success status
 };
 CaptureState g_capture;
+
+// Completion callback for wgpuBufferMapAsync. Both halves of the contract are
+// mandatory in this Dawn build: callbackMode must be non-zero (the INIT macro
+// deliberately zero-fills it - passing it yields "Invalid callback mode: 0"),
+// and Dawn completes *error* futures by invoking the callback, so a null one
+// is a call through 0x0 (the crash in the v2.0.3 acceptance log). Callback
+// mode AllowProcessEvents fires on the thread that ticks the device - the
+// game thread, which is also the one running mod_update.
+void on_map_complete(WGPUMapAsyncStatus status, WGPUStringView /*message*/,
+    void* /*userdata1*/, void* /*userdata2*/) {
+    if (status != WGPUMapAsyncStatus_Success)
+        g_capture.map_failed = true;  // consumed by mod_update -> fail_capture
+}
 
 // --- gigapixel job ----------------------------------------------------------
 // One job = an S x S grid of tiles re-projecting sub-frusta of the master
@@ -201,9 +215,12 @@ struct DataPin {
 DataPin g_pins[] = {
     // MSVC static *class member* data: storage char '2'; bool -> _N, u8 -> E,
     // class object -> PEAV<type>@@; decoration terminates in a single 'A'.
-    {"?mBlureFlag@mDoGph_gInf_c@@2_NA", "mDoGph_gInf_c::mBlureFlag", 0, 1, 0, nullptr, {}, false},
+    // mBlureFlag is declared u8, not bool: storage suffix E, not _N.
+    {"?mBlureFlag@mDoGph_gInf_c@@2EA", "mDoGph_gInf_c::mBlureFlag", 0, 1, 0, nullptr, {}, false},
     {"?mFade@mDoGph_gInf_c@@2EA", "mDoGph_gInf_c::mFade", 0, 1, 0, nullptr, {}, false},
-    {"?m_bloom@mDoGph_gInf_c@@2PEAVbloom_c@@A", "mDoGph_gInf_c::m_bloom", 0x08, 1, 0,
+    // bloom_c is nested inside mDoGph_gInf_c, and m_bloom is an object, not a
+    // pointer: the type encodes as Vbloom_c@mDoGph_gInf_c@@.
+    {"?m_bloom@mDoGph_gInf_c@@2Vbloom_c@mDoGph_gInf_c@@A", "mDoGph_gInf_c::m_bloom", 0x08, 1, 0,
         nullptr, {}, false},
 };
 
@@ -1558,15 +1575,23 @@ MOD_EXPORT ModResult mod_update(ModError* error) {
     // later so the mapping queues behind that submission.
     if (g_capture.phase == CAPTURE_WAIT_COPY) {
         if (g_capture.staging) {
-            // No callback: completion is observed by polling the map state, which
-            // the game's per-frame device activity drives to Mapped.
+            // The callback only records failures; success is observed by
+            // polling the map state, which the game's per-frame device
+            // activity drives to Mapped.
+            WGPUBufferMapCallbackInfo map_info = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
+            map_info.mode = WGPUCallbackMode_AllowProcessEvents;
+            map_info.callback = on_map_complete;
             wgpuBufferMapAsync(g_capture.staging, WGPUMapMode_Read, 0,
                 static_cast<uint64_t>(g_capture.width) * g_capture.height * 4ull,
-                WGPU_BUFFER_MAP_CALLBACK_INFO_INIT);
+                map_info);
             g_capture.phase = CAPTURE_WAIT_MAP;
         } else {
             g_capture.phase = CAPTURE_NONE;
         }
+    }
+    if (g_capture.map_failed) {
+        g_capture.map_failed = false;
+        fail_capture("GPU readback map failed (device or buffer error).");
     }
     if (g_capture.phase == CAPTURE_WAIT_MAP && g_capture.staging &&
         wgpuBufferGetMapState(g_capture.staging) == WGPUBufferMapState_Mapped) {
