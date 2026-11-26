@@ -62,7 +62,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Configure
-        run: cmake -S adapters/dusklight/mod -B build/mod -DDUSKLIGHT_VERSION=${{ matrix.dusklight }}
+        # Quotes matter: the default Windows shell (pwsh) splits an unquoted
+        # -DNAME=v2.0.2 at the '=', handing CMake "v2" (run 45789209300).
+        run: cmake -S adapters/dusklight/mod -B build/mod "-DDUSKLIGHT_VERSION=${{ matrix.dusklight }}"
       - name: Build
         run: cmake --build build/mod --config RelWithDebInfo
       - name: Upload .dusk (baseline build)
