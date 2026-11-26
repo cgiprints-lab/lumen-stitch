@@ -74,18 +74,17 @@ void fit_curve(const char* name_a, const char* name_b, const std::vector<unsigne
     double exp_num = 0, exp_den = 0, gain_num = 0, gain_den = 0;
     int samples = 0;
     for (int c = 0; c < 3; ++c) {
-        if (a[c].size() != b[c].size()) {
-            std::printf("  %s: size mismatch (%zu vs %zu)\n", "c", a[c].size(), b[c].size());
+        if (a[c].empty() || b[c].empty())
             continue;
-        }
         std::vector<unsigned char> sa = a[c], sb = b[c];
         std::sort(sa.begin(), sa.end());
         std::sort(sb.begin(), sb.end());
         std::printf("  ch%d deciles A->B:", c);
         for (int q = 5; q <= 95; q += 10) {
-            const size_t i = size_t(q / 100.0 * double(sa.size() - 1));
-            std::printf(" %.2f->%.2f", sa[i] / 255.0, sb[i] / 255.0);
-            const double x = sa[i] / 255.0, y = sb[i] / 255.0;
+            const size_t ia = size_t(q / 100.0 * double(sa.size() - 1));
+            const size_t ib = size_t(q / 100.0 * double(sb.size() - 1));
+            std::printf(" %.2f->%.2f", sa[ia] / 255.0, sb[ib] / 255.0);
+            const double x = sa[ia] / 255.0, y = sb[ib] / 255.0;
             if (x > 0.02 && y > 0.02) {
                 exp_num += std::log(y) * std::log(x);
                 exp_den += std::log(x) * std::log(x);
@@ -102,19 +101,30 @@ void fit_curve(const char* name_a, const char* name_b, const std::vector<unsigne
     }
 }
 
-bool load_cols(const std::string& path, std::vector<unsigned char> cols[3]) {
+bool load_cols(const std::string& path, std::vector<unsigned char> cols[3], double center) {
     int w = 0, h = 0, ch = 0;
     unsigned char* px = stbi_load(path.c_str(), &w, &h, &ch, 3);
     if (!px) {
         std::printf("%s: load failed (%s)\n", path.c_str(), stbi_failure_reason());
         return false;
     }
-    const size_t n = size_t(w) * size_t(h);
-    for (int c = 0; c < 3; ++c) {
-        cols[c].resize(n);
-        for (size_t i = 0; i < n; ++i)
-            cols[c][i] = px[i * 3 + c];
+    int x0 = 0, y0 = 0, x1 = w, y1 = h;
+    if (center > 0.0) {
+        const int cw = int(w * center), chh = int(h * center);
+        x0 = (w - cw) / 2;
+        y0 = (h - chh) / 2;
+        x1 = x0 + cw;
+        y1 = y0 + chh;
     }
+    size_t n = 0;
+    for (int c = 0; c < 3; ++c)
+        cols[c].clear();
+    for (int y = y0; y < y1; ++y)
+        for (int x = x0; x < x1; ++x)
+            for (int c = 0; c < 3; ++c)
+                cols[c].push_back(px[(size_t(y) * size_t(w) + size_t(x)) * 3 + c]);
+    n = cols[0].size();
+    (void)n;
     stbi_image_free(px);
     return true;
 }
@@ -226,7 +236,7 @@ int main(int argc, char** argv) {
 
     if (!fit.empty() && !files.empty()) {
         std::vector<unsigned char> ca[3], cb[3];
-        if (load_cols(files[0], ca) && load_cols(fit, cb))
+        if (load_cols(files[0], ca, center) && load_cols(fit, cb, center))
             fit_curve(files[0].c_str(), fit.c_str(), ca, cb);
     }
     return 0;

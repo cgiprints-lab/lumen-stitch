@@ -301,6 +301,7 @@ ConfigVarHandle g_var_capture_folder = 0;
 ConfigVarHandle g_var_strip_haze = 0;
 ConfigVarHandle g_var_auto_stitch = 0;
 ConfigVarHandle g_var_freeze_world = 0;
+ConfigVarHandle g_var_swap_rb = 0;
 ConfigVarHandle g_var_seen_controls = 0;
 
 // Background-stitch state (worker thread <-> game thread). See the section
@@ -1454,14 +1455,15 @@ void issue_capture(WGPUDevice device) {
         return;
     }
     // Dims ride the frame's shared uniform stream; binding 2 resolves to that
-    // buffer's pushed slot inside the compute context. swap_rb: WGSL
-    // textureLoad on a BGRA format returns components in the format's order
-    // (x=B, z=R), so the byte packing must swap R and B to hand stbi true
-    // RGBA order.
-    const uint32_t swap_rb =
-        (targets.color_format == WGPUTextureFormat_BGRA8Unorm ||
-            targets.color_format == WGPUTextureFormat_BGRA8UnormSrgb)
-        ? 1u : 0u;
+    // buffer's pushed slot inside the compute context. swap_rb: measured, not
+    // assumed (2026-11-26): the same scene captured and photographed showed
+    // green matching to 3 decimals while red and blue were exactly exchanged
+    // (capture R med .349 vs screen B .345; capture B .475 vs screen R .467).
+    // Dawn's D3D backend samples even bgra8unorm targets in logical
+    // (R,G,B,A) order, so no swap is correct here. The old format-based swap
+    // inverted the picture (warm scenes read blue-grey - the "dark capture"
+    // complaint). The toggle is kept for backends that ever disagree.
+    const uint32_t swap_rb = cfg_bool(g_var_swap_rb, false) ? 1u : 0u;
     const uint32_t dims[4] = {w, h, swap_rb, 0};
     GfxRange uniformRange = {};
     if (svc_gfx->push_uniform(mod_ctx, dims, sizeof(dims), &uniformRange) != MOD_OK) {
@@ -1831,6 +1833,18 @@ ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
     {
         UiControlDesc ctl = UI_CONTROL_DESC_INIT;
         ctl.kind = UI_CONTROL_TOGGLE;
+        ctl.label = "Swap red and blue in captures";
+        ctl.help_rml = "Only for graphics backends that read the scene buffer's red and blue "
+                       "reversed. Off is correct on Dusklight 2.0.3: captures were measured to "
+                       "match the game's colours exactly with this off.";
+        ctl.binding = UI_BINDING_CONFIG_VAR;
+        ctl.config_var = g_var_swap_rb;
+        svc_ui->pane_add_control(mod_ctx, panel, &ctl, nullptr);
+    }
+
+    {
+        UiControlDesc ctl = UI_CONTROL_DESC_INIT;
+        ctl.kind = UI_CONTROL_TOGGLE;
         ctl.label = "Freeze the world in photo mode";
         ctl.help_rml = "Sets the game's own global pause (the same flag the 'freeze' console "
                        "command uses), so actors, enemies, NPCs and their animations stand "
@@ -1889,6 +1903,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     g_var_strip_blur = register_var_typed("stripBlur", CONFIG_VAR_BOOL, 1, 0);
     g_var_auto_stitch = register_var_typed("autoStitch", CONFIG_VAR_BOOL, 1, 0);
     g_var_freeze_world = register_var_typed("freezeWorld", CONFIG_VAR_BOOL, 1, 0);
+    g_var_swap_rb = register_var_typed("swapRB", CONFIG_VAR_BOOL, 0, 0);
     g_var_seen_controls = register_var_typed("seenControls", CONFIG_VAR_BOOL, 0, 0);
     g_pins[0].toggle = g_var_strip_blur;
     g_pins[1].toggle = g_var_strip_fade;
