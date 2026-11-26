@@ -499,16 +499,19 @@ void push_photo_toast(const char* title, const char* body, const char* type = "s
 constexpr char kControlsRml[] =
     "<p><b>F1</b> photo mode on / off - <b>F1 is the way back to the game</b>.</p>"
     "<p><b>F7</b> capture 1x &nbsp; <b>Shift+F7</b> stereo trio<br>"
-    "<b>F12</b> gigapixel &nbsp; <b>Shift+F12</b> 360 panorama</p>"
+    "<b>F12</b> gigapixel &nbsp; <b>Shift+F12</b> 360 panorama<br>"
+    "If an overlay (Steam screenshots use plain F12) steals those keys, the "
+    "<b>Alt+F12</b> and <b>Alt+Shift+F12</b> variants work instead.</p>"
     "<p><b>WASD</b> fly, <b>Q</b>/<b>E</b> down/up, <b>arrow keys</b> look, "
     "<b>Shift</b> boost, <b>PgUp</b>/<b>PgDn</b> zoom.</p>"
     "<p>Gigapixel, 360 and stereo jobs stitch themselves into a BigTIFF in the "
     "background - keep playing while it runs. The mod never touches the game's "
-    "window or display settings.</p>";
+    "window or display settings: the game's own <b>F11</b> toggles fullscreen "
+    "(it sits right next to our F12), and no Lumen key can change it.</p>";
 
 constexpr const char* kPanelControlLines[] = {
     "F1 photo mode on/off - F1 also returns you to the game",
-    "F7 capture 1x - Shift+F7 stereo - F12 gigapixel - Shift+F12 360",
+    "F7 capture 1x - Shift+F7 stereo - F12 or Alt+F12 gigapixel - Shift+F12 360",
     "WASD fly, Q/E down/up, arrow keys look, Shift boost, PgUp/PgDn zoom",
 };
 
@@ -797,9 +800,16 @@ void fail_capture(const char* why) {
 
 // Guard shared by every multi-part capture kind.
 bool job_startable() {
+    // Every rejection speaks up: a key that reached us but was refused must
+    // say why, so a silent job start is never mistaken for a dead hotkey.
     if (!g_photo.active || g_job.active || g_capture.phase != CAPTURE_NONE) {
         if (!g_photo.active)
             push_photo_toast("Lumen Photo Mode", "Enter photo mode first (F1).", "warning");
+        else if (g_job.active)
+            push_photo_toast("Lumen Photo Mode", "A capture job is already running.", "warning");
+        else
+            push_photo_toast("Lumen Photo Mode", "A capture is still finishing - try again.",
+                "warning");
         return false;
     }
     if (!folder_ok()) {
@@ -833,8 +843,11 @@ void start_gigapixel() {
     if (!job_startable())
         return;
     const int64_t S = cfg_int(g_var_capture_scale, 4);
-    if (S < 1)
+    if (S < 1) {
+        push_photo_toast("Lumen Photo Mode",
+            "Tiles per side must be 1 or more (Lumen panel).", "warning");
         return;
+    }
     if (S > 33) {
         push_photo_toast("Lumen Photo Mode",
             "Tiles-per-side above 33 exceeds the supported maximum.", "warning");
@@ -1206,6 +1219,11 @@ bool key_held(int vk) {
 // F9 turned on the game's debug camera under us. Lumen uses only free keys:
 //   F1 photo mode, F7 capture, F12 gigapixel,
 //   Shift+F7 stereo trio, Shift+F12 360 panorama.
+// Alt+ variants of every chord work too - the poll reads the F-key edge with
+// any modifiers held - because third-party overlays (Steam's screenshot
+// hotkey is plain F12) register bare F-keys and can eat them before any app
+// sees them. Never bind Alt+F1: the game hides its ImGui console on Shift+F1
+// and some IME/menu paths use Alt+F1.
 bool g_prev_f1 = false;
 bool g_prev_f7 = false;
 bool g_prev_f12 = false;
