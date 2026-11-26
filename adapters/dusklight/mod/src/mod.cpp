@@ -230,7 +230,8 @@ struct DataPin {
     const char* alt_symbol = nullptr;  // fallback spelling (null = none)
     size_t offset = 0;                 // field offset inside the resolved object
     size_t size = 0;                   // bytes pinned (exact type size)
-    ConfigVarHandle toggle = 0;        // user opt-out var
+    ConfigVarHandle toggle = 0;        // user opt-in/opt-out var
+    bool default_on = true;            // effective value when the var is unset
     void* addr = nullptr;              // resolved address (null = unavailable)
     unsigned char saved[8] = {0};      // original bytes, snapshotted at job start
     bool pinned = false;
@@ -239,15 +240,32 @@ DataPin g_pins[] = {
     // MSVC static *class member* data: storage char '2'; bool -> _N, u8 -> E,
     // class object -> PEAV<type>@@; decoration terminates in a single 'A'.
     // mBlureFlag is declared u8, not bool: storage suffix E, not _N.
-    {"?mBlureFlag@mDoGph_gInf_c@@2EA", "mDoGph_gInf_c::mBlureFlag", 0, 1, 0, nullptr, {}, false},
-    {"?mFade@mDoGph_gInf_c@@2EA", "mDoGph_gInf_c::mFade", 0, 1, 0, nullptr, {}, false},
+    {"?mBlureFlag@mDoGph_gInf_c@@2EA", "mDoGph_gInf_c::mBlureFlag", 0, 1, 0, true, nullptr, {},
+        false},
+    // Bloom, fade and the cloud-shadow haze stay ON by default: they are the
+    // additive/overlay passes the player actually sees, and removing them makes
+    // captures visibly darker and flatter than the game. Motion blur is the one
+    // that must go - it is an EFB trail, so tile N would ghost tile N-1.
+    {"?mFade@mDoGph_gInf_c@@2EA", "mDoGph_gInf_c::mFade", 0, 1, 0, false, nullptr, {}, false},
     // bloom_c is nested inside mDoGph_gInf_c, and m_bloom is an object, not a
     // pointer. MSVC compresses the nested *type* reference with a back-token:
     // the shipped manifest key is ?m_bloom@mDoGph_gInf_c@@2Vbloom_c@1@A
     // (extracted verbatim from the embedded manifest in dusklight.exe).
-    {"?m_bloom@mDoGph_gInf_c@@2Vbloom_c@1@A", "mDoGph_gInf_c::m_bloom", 0x08, 1, 0,
-        nullptr, {}, false},
+    {"?m_bloom@mDoGph_gInf_c@@2Vbloom_c@1@A", "mDoGph_gInf_c::m_bloom", 0x08, 1, 0, false, nullptr,
+        {}, false},
 };
+
+// Photo mode's "the world stands still" switch. Zeroing FrameTiming only slows
+// the fixed-step sim down: with the default settings (frame interpolation off)
+// the game runs its whole logic pass every render frame regardless of the tick
+// count, which is why characters, NPCs and particles kept moving. What actually
+// stops them is the game's own global freeze - the "freeze" console command
+// sets exactly this byte (src/dusk/commands.cpp), and fopAc_Execute skips every
+// actor's per-frame execute while it is set (src/f_op/f_op_actor.cpp:323).
+// mPause is at 0x4 in dComIfAc_info_c (include/d/d_com_inf_actor.h); the
+// manifest key was read out of dusklight.exe (storage char '3' = static object).
+DataPin g_world_pin = {"?g_dComIfAc_gameInfo@@3VdComIfAc_info_c@@A", "g_dComIfAc_gameInfo", 0x04, 1,
+    0, true, nullptr, {}, false};
 
 bool g_haze_hooked = false; // drawCloudShadow pre-hook installed
 
@@ -270,6 +288,7 @@ GfxStageHookHandle g_hook_frame = 0;
 // set is logged once so support reports can see what a build actually got.
 bool g_feat_capture = false; // stage hooks + compute type -> 1x + jobs
 bool g_feat_freeze = false;  // dusk::game_clock::advance hook
+bool g_feat_world_freeze = false; // game's own global actor-pause byte
 bool g_feat_autoexit = false; // dStage_changeScene hook
 bool g_feat_strip = false;   // haze hook or >=1 data pin resolved
 
@@ -283,6 +302,8 @@ ConfigVarHandle g_var_photo_fov = 0;
 ConfigVarHandle g_var_capture_folder = 0;
 ConfigVarHandle g_var_strip_haze = 0;
 ConfigVarHandle g_var_auto_stitch = 0;
+ConfigVarHandle g_var_freeze_world = 0;
+ConfigVarHandle g_var_seen_controls = 0;
 
 // Background-stitch state (worker thread <-> game thread). See the section
 // near folder handling for the full contract.
@@ -337,37 +358,40 @@ void cfg_string(ConfigVarHandle var, char* buffer, size_t size) {
 
 // ------------------------------------------- effect pins (gigapixel consistency)
 
-// Resolve the mDoGph_gInf_c post-effect state symbols once at load. The names
-// come from the shipped symbol manifest; missing/ambiguous names just mean the
-// matching override is unavailable (logged, panel toggle inert).
-void resolve_effect_symbols() {
-    for (DataPin& pin : g_pins) {
-        const char* names[2] = {pin.symbol, pin.alt_symbol};
-        bool found = false;
-        for (const char* name : names) {
-            if (!name)
-                continue;
-            void* addr = nullptr;
-            HookSymbolFlags flags = {};
-            const ModResult r = svc_hook->resolve(mod_ctx, name, &addr, &flags);
-            if (r == MOD_OK && addr) {
-                pin.addr = addr;
-                mods::log::info("lumen: pinned effect state '{}' flags={:04x}", name,
-                    static_cast<unsigned>(flags));
-                found = true;
-                break;
-            }
+// Resolve the mDoGph_gInf_c post-effect state symbols and the actor-freeze flag
+// once at load. The names come from the shipped symbol manifest; missing or
+// ambiguous names just mean the matching override is unavailable (logged, and
+// the panel toggle stays inert).
+bool resolve_pin(DataPin& pin) {
+    const char* names[2] = {pin.symbol, pin.alt_symbol};
+    for (const char* name : names) {
+        if (!name)
+            continue;
+        void* addr = nullptr;
+        HookSymbolFlags flags = {};
+        const ModResult r = svc_hook->resolve(mod_ctx, name, &addr, &flags);
+        if (r == MOD_OK && addr) {
+            pin.addr = addr;
+            mods::log::info("lumen: pinned effect state '{}' flags={:04x}", name,
+                static_cast<unsigned>(flags));
+            return true;
         }
-        if (!found)
-            mods::log::warn("lumen: effect symbol '{}' unavailable; override off", pin.symbol);
     }
+    mods::log::warn("lumen: effect symbol '{}' unavailable; override off", pin.symbol);
+    return false;
+}
+
+void resolve_effect_symbols() {
+    for (DataPin& pin : g_pins)
+        resolve_pin(pin);
+    g_feat_world_freeze = resolve_pin(g_world_pin);
 }
 
 // Snapshot originals then force off, honouring the user toggles.
 void strip_begin() {
     for (DataPin& pin : g_pins) {
         pin.pinned = false;
-        if (!pin.addr || !cfg_bool(pin.toggle, true))
+        if (!pin.addr || !cfg_bool(pin.toggle, pin.default_on))
             continue;
         std::memcpy(pin.saved, static_cast<unsigned char*>(pin.addr) + pin.offset, pin.size);
         std::memset(static_cast<unsigned char*>(pin.addr) + pin.offset, 0, pin.size);
@@ -393,9 +417,29 @@ void strip_end() {
     }
 }
 
+// Photo-mode world freeze: set the game's global actor-pause byte, which is
+// what the game's own "freeze" console command does. Entered on photo-mode
+// entry, released on exit (and on unload), with the previous value restored.
+void world_freeze_begin() {
+    if (!g_world_pin.addr || g_world_pin.pinned || !cfg_bool(g_var_freeze_world, true))
+        return;
+    unsigned char* p = static_cast<unsigned char*>(g_world_pin.addr) + g_world_pin.offset;
+    std::memcpy(g_world_pin.saved, p, g_world_pin.size);
+    *p = 1;
+    g_world_pin.pinned = true;
+}
+
+void world_freeze_end() {
+    if (!g_world_pin.pinned)
+        return;
+    std::memcpy(static_cast<unsigned char*>(g_world_pin.addr) + g_world_pin.offset,
+        g_world_pin.saved, g_world_pin.size);
+    g_world_pin.pinned = false;
+}
+
 // drawCloudShadow pre-hook: skip the moya haze draw while a job is running.
 HookAction on_cloud_shadow_pre(ModContext*, void*, void*, void*) {
-    if (g_job.active && g_haze_hooked && cfg_bool(g_var_strip_haze, true))
+    if (g_job.active && g_haze_hooked && cfg_bool(g_var_strip_haze, false))
         return HOOK_SKIP_ORIGINAL;
     return HOOK_CONTINUE;
 }
@@ -403,6 +447,7 @@ HookAction on_cloud_shadow_pre(ModContext*, void*, void*, void*) {
 // ---------------------------------------------------------------- ui helpers
 
 UiElementHandle g_status_text = 0;
+UiElementHandle g_toggle_button = 0;
 
 const char* status_label() {
     static char buf[128];
@@ -425,17 +470,63 @@ const char* status_label() {
             g_stitch_percent.load());
         return sbuf;
     }
-    return g_photo.frozen ? "photo mode: ON, time frozen"
-                          : "photo mode: ON, time running";
+    return g_photo.frozen || g_world_pin.pinned
+               ? "PHOTO MODE ON - the world is stopped. Press F1 to play again."
+               : "PHOTO MODE ON - press F1 to play again.";
 }
 
-void push_photo_toast(const char* title, const char* body, const char* type = "success") {
+void push_photo_toast(const char* title, const char* body, const char* type = "success",
+    uint32_t duration_ms = 3000) {
     UiToastDesc toast = UI_TOAST_DESC_INIT;
     toast.type = type;
     toast.title_rml = title;
     toast.body_rml = body;
-    toast.duration_ms = 3000;
+    toast.duration_ms = duration_ms;
     svc_ui->push_toast(mod_ctx, &toast);
+}
+
+// ---------------------------------------------------------------- help / controls
+//
+// Photo mode is easy to get lost in: the camera leaves the player, the world
+// stops, and nothing on screen says how to get back. So the control map is
+// stated three ways - a long toast on entry, a first-run dialog, and a
+// permanent block at the top of the mods panel.
+
+constexpr char kControlsRml[] =
+    "<p><b>F1</b> photo mode on / off - <b>F1 is the way back to the game</b>.</p>"
+    "<p><b>F7</b> capture 1x &nbsp; <b>Shift+F7</b> stereo trio<br>"
+    "<b>F12</b> gigapixel &nbsp; <b>Shift+F12</b> 360 panorama</p>"
+    "<p><b>WASD</b> fly, <b>Q</b>/<b>E</b> down/up, <b>arrow keys</b> look, "
+    "<b>Shift</b> boost, <b>PgUp</b>/<b>PgDn</b> zoom.</p>"
+    "<p>Gigapixel, 360 and stereo jobs stitch themselves into a BigTIFF in the "
+    "background - keep playing while it runs. The mod never touches the game's "
+    "window or display settings.</p>";
+
+constexpr const char* kPanelControlLines[] = {
+    "F1 photo mode on/off - F1 also returns you to the game",
+    "F7 capture 1x - Shift+F7 stereo - F12 gigapixel - Shift+F12 360",
+    "WASD fly, Q/E down/up, arrow keys look, Shift boost, PgUp/PgDn zoom",
+};
+
+void on_controls_dismiss(ModContext*, UiDialogHandle, void*) {}
+
+void push_controls_dialog() {
+    UiDialogAction actions[] = {
+        {sizeof(UiDialogAction), "Got it", on_controls_dismiss, nullptr, false, nullptr},
+    };
+    UiDialogDesc desc = UI_DIALOG_DESC_INIT;
+    desc.title = "Lumen Photo Mode - controls";
+    desc.body_rml = kControlsRml;
+    desc.actions = actions;
+    desc.action_count = sizeof(actions) / sizeof(actions[0]);
+    static UiDialogHandle handle = 0;
+    if (svc_ui->dialog_push(mod_ctx, &desc, &handle) != MOD_OK)
+        push_photo_toast("Lumen Photo Mode", "F1 photo mode - F7 capture - F12 gigapixel", "info",
+            8000);
+}
+
+void on_show_controls_pressed(ModContext*, void*) {
+    push_controls_dialog();
 }
 
 // ---------------------------------------------------------------- camera operator
@@ -1001,7 +1092,7 @@ void record_job_tile() {
     if (wrote) {
         char body[256];
         std::snprintf(body, sizeof(body),
-            "%s done: %zu %s saved.",
+            "%s done: %zu %s saved. Press F1 to return to the game.",
             kind == JobState::CUBE360   ? "360 panorama"
                 : kind == JobState::STEREO ? "Stereo"
                                            : "Gigapixel",
@@ -1009,7 +1100,7 @@ void record_job_tile() {
             kind == JobState::CUBE360   ? "faces"
                 : kind == JobState::STEREO ? "views"
                                            : "tiles");
-        push_photo_toast("Lumen Photo Mode", body);
+        push_photo_toast("Lumen Photo Mode", body, "success", 8000);
         mods::log::info("lumen: {} job {} complete ({} parts)",
             kind == JobState::CUBE360   ? "360"
                 : kind == JobState::STEREO ? "stereo"
@@ -1047,15 +1138,32 @@ void enter_photo_mode() {
         mods::log::warn("lumen: camera operator registration failed");
     }
 
-    // Time freeze: the advance() post-hook zeroes numSimTicks while frozen. Only
-    // engage if the hook resolved at load.
+    // Time freeze: the advance() post-hook zeroes numSimTicks and dt while
+    // frozen; the world freeze additionally sets the game's own global
+    // actor-pause byte. Only engage what actually resolved at load.
     g_photo.frozen = g_feat_freeze;
+    world_freeze_begin();
 
-    push_photo_toast("Lumen Photo Mode",
-        g_photo.frozen
-            ? "Photo mode on - time frozen. WASD to fly, F7 capture, F12 gigapixel."
-            : "Photo mode on (time freeze unavailable). F7 capture, F12 gigapixel.");
-    mods::log::info("lumen: photo mode on (frozen={})", g_photo.frozen);
+    char body[256];
+    if (g_world_pin.pinned)
+        std::snprintf(body, sizeof(body),
+            "Photo mode on - the world is frozen. F7 capture, F12 gigapixel, "
+            "Shift+F12 360, Shift+F7 stereo. Press F1 to return to the game.");
+    else if (g_photo.frozen)
+        std::snprintf(body, sizeof(body),
+            "Photo mode on - time stopped (actor freeze unavailable). "
+            "Press F1 to return to the game.");
+    else
+        std::snprintf(body, sizeof(body),
+            "Photo mode on (freeze unavailable in this build). Press F1 to return to the game.");
+    push_photo_toast("Lumen Photo Mode", body, "info", 12000);
+    if (!cfg_bool(g_var_seen_controls, false)) {
+        if (g_var_seen_controls)
+            svc_config->set_bool(mod_ctx, g_var_seen_controls, true);
+        push_controls_dialog();
+    }
+    mods::log::info("lumen: photo mode on (clock freeze={}, world freeze={})", g_photo.frozen,
+        g_world_pin.pinned);
 }
 
 void exit_photo_mode() {
@@ -1065,6 +1173,7 @@ void exit_photo_mode() {
         abort_job(false);
     g_photo.active = false;
     g_photo.frozen = false;
+    world_freeze_end();
     // Keep the operator registered a little longer: it spends the next few
     // frames writing the game's original pose back (photo_operate's restore
     // branch), and mod_update unregisters it once that handoff is done.
@@ -1510,7 +1619,13 @@ HookAction on_stage_change_pre(ModContext*, void*, void*, void*) {
 void on_advance_post(ModContext*, void*, void* retval, void*) {
     if (!g_photo.active || !g_photo.frozen || !retval)
         return;
-    static_cast<FrameTimingMirror*>(retval)->numSimTicks = 0;
+    auto* timing = static_cast<FrameTimingMirror*>(retval);
+    timing->numSimTicks = 0;
+    // Also stop the clock itself: dt drives interpolation, particle/texture
+    // animation and UI motion, all of which keep running on a tick-only freeze.
+    // Lumen's own flight input uses a steady clock (mod_update), so flying the
+    // free camera is unaffected.
+    timing->dt = 0.0f;
 }
 
 // ---------------------------------------------------------------- ui panel
@@ -1562,13 +1677,26 @@ ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
     svc_ui->pane_add_section(mod_ctx, panel, "Photo session");
     svc_ui->pane_add_text(mod_ctx, panel, status_label(), &g_status_text);
 
+    // Say the controls out loud: players lose the camera in photo mode because
+    // nothing tells them F1 gives it back.
+    for (const char* line : kPanelControlLines)
+        svc_ui->pane_add_text(mod_ctx, panel, line, nullptr);
+
+    UiControlDesc help = UI_CONTROL_DESC_INIT;
+    help.kind = UI_CONTROL_BUTTON;
+    help.label = "Show the controls window";
+    help.help_rml = "Reopens the first-run controls window.";
+    help.on_pressed = on_show_controls_pressed;
+    svc_ui->pane_add_control(mod_ctx, panel, &help, nullptr);
+
     UiControlDesc toggle = UI_CONTROL_DESC_INIT;
     toggle.kind = UI_CONTROL_BUTTON;
-    toggle.label = "Toggle photo mode";
+    toggle.label = g_photo.active ? "Return to the game (F1)" : "Enter photo mode (F1)";
     toggle.help_rml = "Freezes the scene and hands the camera to Lumen. "
-                      "WASD/QE fly, arrows look, Shift boosts, PgUp/PgDn zoom.";
+                      "WASD/QE fly, arrow keys look, Shift boosts, PgUp/PgDn zoom. "
+                      "F1 again gives the game back.";
     toggle.on_pressed = on_toggle_pressed;
-    svc_ui->pane_add_control(mod_ctx, panel, &toggle, nullptr);
+    svc_ui->pane_add_control(mod_ctx, panel, &toggle, &g_toggle_button);
 
     UiControlDesc capture = UI_CONTROL_DESC_INIT;
     capture.kind = UI_CONTROL_BUTTON;
@@ -1678,6 +1806,10 @@ ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
     svc_ui->pane_add_control(mod_ctx, panel, &ipd, nullptr);
 
     svc_ui->pane_add_section(mod_ctx, panel, "Gigapixel consistency");
+    svc_ui->pane_add_text(mod_ctx, panel,
+        "Off by default: captures keep the look of the game (bloom, haze and fade stay on). "
+        "Turn one on if the seams between tiles bother you - motion blur stays stripped "
+        "because it would ghost the previous tile into the next.", nullptr);
     struct StripToggleDesc {
         const char* label;
         const char* help;
@@ -1685,16 +1817,19 @@ ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
     };
     const StripToggleDesc stripToggles[] = {
         {"Strip cloud-shadow haze",
-            "Skips the moya haze draw while a gigapixel job runs. It is screen-space, so it "
-            "would differ between tiles.", g_var_strip_haze},
+            "Skips the moya haze draw while a multi-tile job runs. It is drawn in screen space, "
+            "so its exact pattern differs between tiles.", g_var_strip_haze},
         {"Strip bloom",
-            "Turns bloom off during gigapixel jobs (it composites over the viewport).",
+            "Turns bloom off during multi-tile jobs. It composites over the whole viewport, so "
+            "it can differ across tile borders - but bloom adds a lot of the scene's light, so "
+            "stripping it makes captures darker and flatter than the game.",
             g_var_strip_bloom},
         {"Strip fade",
-            "Forces the screen fade to zero during gigapixel jobs.", g_var_strip_fade},
-        {"Strip motion blur",
-            "Turns motion blur off during gigapixel jobs (a temporal effect).",
-            g_var_strip_blur},
+            "Forces the screen fade to zero during multi-tile jobs, so a fade that changes "
+            "between tiles cannot show up as a brightness step.", g_var_strip_fade},
+        {"Strip motion blur (recommended)",
+            "Turns motion blur off during multi-tile jobs: it is an EFB trail, so without this "
+            "tile N ghosts the image of tile N-1. On by default.", g_var_strip_blur},
     };
     for (const StripToggleDesc& t : stripToggles) {
         UiControlDesc ctl = UI_CONTROL_DESC_INIT;
@@ -1703,6 +1838,18 @@ ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
         ctl.help_rml = t.help;
         ctl.binding = UI_BINDING_CONFIG_VAR;
         ctl.config_var = t.var;
+        svc_ui->pane_add_control(mod_ctx, panel, &ctl, nullptr);
+    }
+
+    {
+        UiControlDesc ctl = UI_CONTROL_DESC_INIT;
+        ctl.kind = UI_CONTROL_TOGGLE;
+        ctl.label = "Freeze the world in photo mode";
+        ctl.help_rml = "Sets the game's own global pause (the same flag the 'freeze' console "
+                       "command uses), so actors, enemies, NPCs and their animations stand "
+                       "still while you frame a shot. Release restores the previous state.";
+        ctl.binding = UI_BINDING_CONFIG_VAR;
+        ctl.config_var = g_var_freeze_world;
         svc_ui->pane_add_control(mod_ctx, panel, &ctl, nullptr);
     }
 
@@ -1723,6 +1870,9 @@ ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
 ModResult update_panel(ModContext*, void*, ModError*) {
     if (g_status_text)
         svc_ui->elem_set_text(mod_ctx, g_status_text, status_label());
+    if (g_toggle_button)
+        svc_ui->control_set_label(mod_ctx, g_toggle_button,
+            g_photo.active ? "Return to the game (F1)" : "Enter photo mode (F1)");
     return MOD_OK;
 }
 
@@ -1743,11 +1893,16 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     g_var_photo_fov = register_var_typed("photoFov", CONFIG_VAR_INT, 90, 0);
     g_var_capture_folder = register_var_typed("captureFolder", CONFIG_VAR_STRING, 0, 0);
     cfg_string(g_var_capture_folder, g_folder_location, sizeof(g_folder_location));
-    g_var_strip_haze = register_var_typed("stripHaze", CONFIG_VAR_BOOL, 1, 0);
-    g_var_strip_bloom = register_var_typed("stripBloom", CONFIG_VAR_BOOL, 1, 0);
-    g_var_strip_fade = register_var_typed("stripFade", CONFIG_VAR_BOOL, 1, 0);
+    // Consistency defaults: only the EFB-trail motion blur is stripped by
+    // default. Bloom / haze / fade are the passes the player sees, so taking
+    // them out changes the picture (darker, flatter) - opt-in for seam purity.
+    g_var_strip_haze = register_var_typed("stripHaze", CONFIG_VAR_BOOL, 0, 0);
+    g_var_strip_bloom = register_var_typed("stripBloom", CONFIG_VAR_BOOL, 0, 0);
+    g_var_strip_fade = register_var_typed("stripFade", CONFIG_VAR_BOOL, 0, 0);
     g_var_strip_blur = register_var_typed("stripBlur", CONFIG_VAR_BOOL, 1, 0);
     g_var_auto_stitch = register_var_typed("autoStitch", CONFIG_VAR_BOOL, 1, 0);
+    g_var_freeze_world = register_var_typed("freezeWorld", CONFIG_VAR_BOOL, 1, 0);
+    g_var_seen_controls = register_var_typed("seenControls", CONFIG_VAR_BOOL, 0, 0);
     g_pins[0].toggle = g_var_strip_blur;
     g_pins[1].toggle = g_var_strip_fade;
     g_pins[2].toggle = g_var_strip_bloom;
@@ -1811,10 +1966,13 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     // minor floor the loader will accept, and the host is only interesting
     // for support chatter. The feature line below says what matters.
     mods::log::info(
-        "lumen: features: capture {}, freeze {}, auto-exit {}, consistency {}",
+        "lumen: features: capture {}, clock freeze {}, world freeze {}, auto-exit {}, "
+        "consistency {}",
         g_feat_capture ? "yes" : "NO", g_feat_freeze ? "yes" : "no",
-        g_feat_autoexit ? "yes" : "no", g_feat_strip ? "yes" : "no");
-    mods::log::info("Lumen Photo Mode {} loaded (M4: photo + freeze + gigapixel + 360 + stereo)",
+        g_feat_world_freeze ? "yes" : "no", g_feat_autoexit ? "yes" : "no",
+        g_feat_strip ? "yes" : "no");
+    mods::log::info("Lumen Photo Mode {} loaded (M6: photo + world freeze + gigapixel + 360 + "
+                    "stereo + in-mod auto-stitch)",
         "0.1.0");
     return MOD_OK;
 }
@@ -1915,6 +2073,9 @@ MOD_EXPORT ModResult mod_shutdown(ModError* error) {
     abort_job(false);
     g_photo.active = false;
     g_photo.frozen = false;
+    // Never leave the game parked in its own global pause because the mod was
+    // disabled or reloaded mid-shot.
+    world_freeze_end();
     if (g_operator) {
         svc_camera->unregister_camera_operator(mod_ctx, g_operator);
         g_operator = 0;
