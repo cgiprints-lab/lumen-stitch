@@ -1,0 +1,25 @@
+{
+  "id": "dusklight",
+  "name": "Dusklight",
+  "detection": {
+    "data_dirs": [
+      "%APPDATA%/TwilitRealm/Dusklight",
+      "~/.local/share/TwilitRealm/Dusklight",
+      "~/Library/Application Support/TwilitRealm/Dusklight"
+    ],
+    "mod_subdir": "mods",
+    "markers": ["config.json"]
+  },
+  "integration": {
+    "mod_id": "dev.lumen.photo",
+    "bundle": "lumen_photo.dusk",
+    "source_dir": "mod",
+    "cmake_target": "lumen_photo"
+  },
+  "artifacts": {
+    "windows-x64": "artifacts/windows-x64/lumen_photo.dusk",
+    "linux-x64": "artifacts/linux-x64/lumen_photo.dusk",
+    "macos-arm64": "artifacts/macos-arm64/lumen_photo.dusk",
+    "android-arm64": "artifacts/android-arm64/lumen_photo.dusk"
+  }
+}

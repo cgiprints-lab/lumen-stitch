@@ -1,4 +1,6 @@
 build/
-dusklight/
+# the SDK checkout fetched by FetchDusklight.cmake (the pattern must not match
+# the adapters/dusklight directory itself)
+adapters/*/mod/dusklight/
 .stamp
 *.dusk.bak-*

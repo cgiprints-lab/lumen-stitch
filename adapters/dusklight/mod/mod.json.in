@@ -1,0 +1,7 @@
+{
+  "id": "dev.lumen.photo",
+  "name": "Lumen Photo Mode",
+  "version": "@PROJECT_VERSION@",
+  "author": "Lumen",
+  "description": "Ansel-style photo mode: free camera, time freeze and gigapixel screenshots. Installed by Lumen; independent of Dusklight itself."
+}
