@@ -19,6 +19,7 @@ struct JobTile {
     double yaw = 0;    // radians
     double pitch = 0;  // radians
     double fovy = 90;  // degrees
+    double ox = 0, oy = 0, oz = 0;  // eye offset from master eye (stereo)
     uint32_t w = 0, h = 0;
     uint32_t rect[4] = {0, 0, 0, 0};  // master-pixel rect [x0,y0,x1,y1)
 };
@@ -26,6 +27,7 @@ struct JobTile {
 struct Job {
     int version = 1;
     uint32_t scale = 1;
+    std::string layout = "gigapixel";  // "gigapixel" | "cube360" | "stereo"
     tilemath::Master master;
     std::vector<JobTile> tiles;
     std::filesystem::path base_dir;  // tile files resolved against this
@@ -50,9 +52,23 @@ bool composite(const Job& job, const StripFn& strip,
 bool composite_scaled(const Job& job, uint32_t factor, const StripFn& strip,
     const std::function<void(uint32_t percent)>& progress, std::string& err);
 
+// Compose a 2:1 equirectangular panorama from a cube360 job (six FOV-90
+// faces, tilemath::cube360_faces). Panorama longitude is centered on
+// master.yaw, latitude is world pitch. Each output pixel goes to the face
+// whose axis is closest to its ray (seams land in the face overlaps).
+bool composite_equire(const Job& job, uint32_t out_width, const StripFn& strip,
+    const std::function<void(uint32_t percent)>& progress, std::string& err);
+
+// Paste tiles 1:1 into their master rects (stereo layout: translated eyes
+// break the shared-eye homography, so no resampling - each tile is already
+// exactly its rect). Decodes one band of tiles at a time.
+bool composite_direct(const Job& job, const StripFn& strip,
+    const std::function<void(uint32_t percent)>& progress, std::string& err);
+
 struct Options {
     std::filesystem::path out;              // primary .tiff
     uint32_t downscale = 1;                 // N>1: primary = master / N box downsample
+    uint32_t equire_width = 4096;           // cube360 layout: panorama width (2:1)
     bool preview_jpeg = true;               // reduced-level JPEG preview
     bool preview_png = false;               // reduced-level PNG preview
     uint32_t preview_max = 4096;            // longest edge for previews

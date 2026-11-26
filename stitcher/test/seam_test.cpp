@@ -10,6 +10,10 @@
 //     chain, and a decodable JPEG preview.
 //  4. downsample path: composite_scaled box-average matches the exact master
 //     grid downsample; run() level-0 dims are ceil(master / N).
+//  5. cube360 -> equirectangular: six FOV-90 faces stitch to an exact 2:1
+//     panorama (every pixel, face seams included).
+//  6. stereo trio: eye offsets parse, 1:1 side-by-side paste matches a
+//     per-eye reference exactly (parallax preserved, no shared-eye warp).
 //
 // Exits non-zero on the first failure.
 #include "stitch.h"
@@ -440,6 +444,286 @@ void test_downscale(const std::filesystem::path& tmp) {
     std::fclose(fd);
 }
 
+// ---------------------------------------------------------------- test 5
+
+// cube360 -> equirectangular: six FOV-90 faces rendered from one continuous
+// scene, stitched by composite_equire, compared against an exact equirect
+// reference over every panorama pixel (seams included).
+void test_cube360(const std::filesystem::path& tmp) {
+    std::printf("cube360 -> equirectangular (6 faces vs exact reference):\n");
+    const double yaw = 0.7;
+    lumen::tilemath::FacePose faces[6];
+    lumen::tilemath::cube360_faces(yaw, faces);
+
+    std::string manifest =
+        "{\"lumenJob\":1,\"layout\":\"cube360\",\"scale\":1,\"master\":{\"yaw\":0.7,\"pitch\":0,"
+        "\"fovy\":90,\"vw\":64,\"vh\":48,\"width\":256,\"height\":96},\"tiles\":[";
+    for (int i = 0; i < 6; ++i) {
+        lumen::tilemath::Tile t;
+        t.yaw = faces[i].yaw;
+        t.pitch = faces[i].pitch;
+        t.fovy = lumen::tilemath::kCube360Fovy;
+        t.w = 64;
+        t.h = 48;
+        const auto img = render_tile_rgba(t);
+        char fname[64];
+        std::snprintf(fname, sizeof(fname), "cube-%d-%d.png", faces[i].row, faces[i].col);
+        if (!stbi_write_png((tmp / fname).string().c_str(), 64, 48, 4, img.data(), 64 * 4)) {
+            check(false, std::string("face png write failed: ") + fname);
+            return;
+        }
+        char buf[512];
+        std::snprintf(buf, sizeof(buf),
+            "%s{\"file\":\"%s\",\"row\":%d,\"col\":%d,\"yaw\":%.17g,\"pitch\":%.17g,"
+            "\"fovy\":%.17g,\"width\":64,\"height\":48,\"rect\":[%d,%d,%d,%d]}",
+            i ? "," : "", fname, faces[i].row, faces[i].col, t.yaw, t.pitch, t.fovy,
+            faces[i].col * 64, faces[i].row * 48, faces[i].col * 64 + 64,
+            faces[i].row * 48 + 48);
+        manifest += buf;
+    }
+    manifest += "]}";
+    const auto cube_path = tmp / "cube.json";
+    {
+        std::ofstream out(cube_path, std::ios::binary);
+        out << manifest;
+    }
+
+    lumen::stitch::Job job;
+    std::string err;
+    if (!lumen::stitch::load_job(cube_path, job, err)) {
+        check(false, "load_job(cube): " + err);
+        return;
+    }
+    check(job.layout == "cube360", "layout recorded");
+
+    const uint32_t EW = 256, EH = 128;
+    std::vector<uint8_t> raster(static_cast<size_t>(EW) * EH * 3);
+    if (!lumen::stitch::composite_equire(job, EW,
+            [&](uint64_t y0, uint64_t n, const uint8_t* rgb) {
+                for (uint64_t r = 0; r < n; ++r)
+                    std::copy(rgb + r * EW * 3, rgb + (r + 1) * EW * 3,
+                        raster.data() + (y0 + r) * EW * 3);
+                return true;
+            },
+            {}, err)) {
+        check(false, "composite_equire: " + err);
+        return;
+    }
+    int worst = 0;
+    for (uint32_t y = 0; y < EH; ++y) {
+        const double phi = (0.5 - (y + 0.5) / static_cast<double>(EH)) * lumen::tilemath::kPi;
+        const double cp = std::cos(phi), sp = std::sin(phi);
+        for (uint32_t x = 0; x < EW; ++x) {
+            const double lam = ((x + 0.5) / static_cast<double>(EW) * 2.0 - 1.0) *
+                               lumen::tilemath::kPi;
+            const double d[3] = {cp * std::sin(yaw + lam), sp, cp * std::cos(yaw + lam)};
+            uint8_t ref[3];
+            scene(d, ref);
+            for (int c = 0; c < 3; ++c)
+                worst = std::max(worst,
+                    std::abs(static_cast<int>(raster[(static_cast<size_t>(y) * EW + x) * 3 + c]) -
+                        static_cast<int>(ref[c])));
+        }
+    }
+    check(worst <= 4, "equirectangular matches exact reference over every pixel within "
+            "4/255 (worst " + std::to_string(worst) + ")");
+
+    // run(): primary dimensions are the panorama 2:1 grid.
+    lumen::stitch::Options opt;
+    opt.out = tmp / "cube.tiff";
+    opt.equire_width = EW;
+    opt.preview_max = 64;
+    opt.min_mip_edge = 16;
+    if (!lumen::stitch::run(cube_path, opt, err)) {
+        check(false, "stitch::run(cube360): " + err);
+        return;
+    }
+    std::FILE* fc = std::fopen(opt.out.string().c_str(), "rb");
+    if (!fc) {
+        check(false, "cannot reopen panorama output");
+        return;
+    }
+    rd(fc, 2);
+    rd(fc, 2);
+    rd(fc, 2);
+    rd(fc, 2);
+    std::vector<IfdEntry> ifd0;
+    uint64_t next = 0;
+    if (read_ifd(fc, rd(fc, 8), ifd0, next)) {
+        const auto* w = find_entry(ifd0, 256);
+        const auto* h = find_entry(ifd0, 257);
+        check(w && w->value == EW && h && h->value == EH, "panorama level 0 is 256x128");
+    } else
+        check(false, "panorama IFD0 parses");
+    std::fclose(fc);
+}
+
+// ---------------------------------------------------------------- test 6
+
+// Position-based scene: with eyes translated, tiles genuinely disagree
+// (parallax), so a shared-eye resampler would visibly warp - only the 1:1
+// paste per rect is correct for this layout.
+void scene_pos(const double p[3], uint8_t* rgb) {
+    rgb[0] = static_cast<uint8_t>(127.5 + 110.0 * std::sin(0.6 + 0.9 * p[0] + 0.3 * p[2]));
+    rgb[1] = static_cast<uint8_t>(127.5 + 110.0 * std::sin(1.9 - 0.7 * p[1] + 0.5 * p[0]));
+    rgb[2] = static_cast<uint8_t>(127.5 + 110.0 * std::cos(1.1 + 0.8 * p[2] - 0.4 * p[1]));
+}
+
+// Render a stereo view at a translated eye: pixel -> pinhole ray -> fixed
+// plane along the ray -> scene position (parallax vs the center eye).
+void render_view_rgba(double yaw, double pitch, double fovy, uint32_t w, uint32_t h,
+    const double eye[3], std::vector<uint8_t>& img) {
+    double ft[3], rt[3], ut[3];
+    lumen::tilemath::basis(yaw, pitch, ft, rt, ut);
+    const double thty = std::tan(lumen::tilemath::rad(fovy) / 2.0);
+    const double thtx = thty * static_cast<double>(w) / static_cast<double>(h);
+    img.assign(static_cast<size_t>(w) * h * 4, 0);
+    for (uint32_t j = 0; j < h; ++j) {
+        const double my = (1.0 - (j + 0.5) / h * 2.0) * thty;
+        for (uint32_t i = 0; i < w; ++i) {
+            const double mx = ((i + 0.5) / w * 2.0 - 1.0) * thtx;
+            double d[3];
+            for (int k = 0; k < 3; ++k)
+                d[k] = ft[k] + mx * rt[k] + my * ut[k];
+            const double n = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+            double p[3];
+            for (int k = 0; k < 3; ++k)
+                p[k] = eye[k] + 5.0 * d[k] / n;
+            uint8_t* q = img.data() + (static_cast<size_t>(j) * w + i) * 4;
+            scene_pos(p, q);
+            q[3] = 255;
+        }
+    }
+}
+
+// stereo trio -> side-by-side: parse of eye offsets, 1:1 paste per rect, and
+// run() primary dimensions.
+void test_stereo(const std::filesystem::path& tmp) {
+    std::printf("stereo trio -> side-by-side (translated eyes, 1:1 paste):\n");
+    const double yaw = 1.1, pitch = 0.3, fovy = 74.0, ipd = 2.0;
+    const uint32_t vw = 32, vh = 48;
+    // Same convention as the mod: right = (cos yaw, 0, -sin yaw), offsets
+    // -ipd/2 / 0 / +ipd/2.
+    const double rx = std::cos(yaw), rz = -std::sin(yaw);
+    const double signs[3] = {-1.0, 0.0, 1.0};
+
+    std::string manifest =
+        "{\"lumenJob\":1,\"layout\":\"stereo\",\"scale\":1,\"colorFormat\":2,\"master\":{\"yaw\":1.1,"
+        "\"pitch\":0.3,\"fovy\":74,\"vw\":32,\"vh\":48,\"width\":96,\"height\":48},\"tiles\":[";
+    for (int i = 0; i < 3; ++i) {
+        const double eye[3] = {signs[i] * ipd * 0.5 * rx, 0.0, signs[i] * ipd * 0.5 * rz};
+        std::vector<uint8_t> img;
+        render_view_rgba(yaw, pitch, fovy, vw, vh, eye, img);
+        char fname[64];
+        std::snprintf(fname, sizeof(fname), "stereo-0-%d.png", i);
+        if (!stbi_write_png((tmp / fname).string().c_str(), static_cast<int>(vw),
+                static_cast<int>(vh), 4, img.data(), static_cast<int>(vw) * 4)) {
+            check(false, std::string("stereo png write failed: ") + fname);
+            return;
+        }
+        char buf[512];
+        std::snprintf(buf, sizeof(buf),
+            "%s{\"file\":\"%s\",\"row\":0,\"col\":%d,\"yaw\":%.17g,\"pitch\":%.17g,"
+            "\"fovy\":%.17g,\"width\":32,\"height\":48,\"eye\":[%.17g,0,%.17g],"
+            "\"rect\":[%d,0,%d,48]}",
+            i ? "," : "", fname, i, yaw, pitch, fovy, eye[0], eye[2], i * static_cast<int>(vw),
+            (i + 1) * static_cast<int>(vw));
+        manifest += buf;
+    }
+    manifest += "]}";
+    const auto st_path = tmp / "stereo.json";
+    {
+        std::ofstream out(st_path, std::ios::binary);
+        out << manifest;
+    }
+
+    lumen::stitch::Job job;
+    std::string err;
+    if (!lumen::stitch::load_job(st_path, job, err)) {
+        check(false, "load_job(stereo): " + err);
+        return;
+    }
+    check(job.layout == "stereo", "layout recorded");
+    bool eye_ok = job.tiles.size() == 3 && job.tiles[0].ox < 0 && job.tiles[1].ox == 0 &&
+                  job.tiles[2].ox > 0 &&
+                  std::fabs(job.tiles[0].ox + ipd * 0.5 * rx) < 1e-12 &&
+                  std::fabs(job.tiles[0].oz + ipd * 0.5 * rz) < 1e-12 &&
+                  std::fabs(job.tiles[2].ox - ipd * 0.5 * rx) < 1e-12;
+    check(eye_ok, "eye offsets parsed with the mod's right-axis convention");
+
+    std::vector<uint8_t> raster(static_cast<size_t>(96) * 48 * 3);
+    if (!lumen::stitch::composite_direct(job,
+            [&](uint64_t y0, uint64_t n, const uint8_t* rgb) {
+                for (uint64_t r = 0; r < n; ++r)
+                    std::copy(rgb + r * 96 * 3, rgb + (r + 1) * 96 * 3,
+                        raster.data() + (y0 + r) * 96 * 3);
+                return true;
+            },
+            {}, err)) {
+        check(false, "composite_direct: " + err);
+        return;
+    }
+    // Reference: each master pixel re-rendered from its own tile eye.
+    int worst = 0;
+    for (uint32_t y = 0; y < 48; ++y) {
+        for (uint32_t x = 0; x < 96; ++x) {
+            const int ti = static_cast<int>(x / vw);
+            const auto& t2 = job.tiles[ti];
+            const double eye[3] = {t2.ox, t2.oy, t2.oz};
+            const uint32_t lx = x % vw;
+            // Re-project only the single pixel through the same formula.
+            double ft[3], rt[3], ut[3];
+            lumen::tilemath::basis(t2.yaw, t2.pitch, ft, rt, ut);
+            const double thty = std::tan(lumen::tilemath::rad(t2.fovy) / 2.0);
+            const double thtx = thty * 32.0 / 48.0;
+            const double my = (1.0 - (y + 0.5) / 48.0 * 2.0) * thty;
+            const double mx = ((lx + 0.5) / 32.0 * 2.0 - 1.0) * thtx;
+            double d[3];
+            for (int k = 0; k < 3; ++k)
+                d[k] = ft[k] + mx * rt[k] + my * ut[k];
+            const double n = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+            double p[3];
+            for (int k = 0; k < 3; ++k)
+                p[k] = eye[k] + 5.0 * d[k] / n;
+            uint8_t ref[3];
+            scene_pos(p, ref);
+            for (int c = 0; c < 3; ++c)
+                worst = std::max(worst,
+                    std::abs(static_cast<int>(raster[(static_cast<size_t>(y) * 96 + x) * 3 + c]) -
+                        static_cast<int>(ref[c])));
+        }
+    }
+    check(worst == 0, "side-by-side matches per-eye reference exactly (worst " +
+                          std::to_string(worst) + ")");
+
+    lumen::stitch::Options opt;
+    opt.out = tmp / "stereo.tiff";
+    opt.preview_max = 64;
+    opt.min_mip_edge = 16;
+    if (!lumen::stitch::run(st_path, opt, err)) {
+        check(false, "stitch::run(stereo): " + err);
+        return;
+    }
+    std::FILE* fs2 = std::fopen(opt.out.string().c_str(), "rb");
+    if (!fs2) {
+        check(false, "cannot reopen stereo output");
+        return;
+    }
+    rd(fs2, 2);
+    rd(fs2, 2);
+    rd(fs2, 2);
+    rd(fs2, 2);
+    std::vector<IfdEntry> ifd0;
+    uint64_t next = 0;
+    if (read_ifd(fs2, rd(fs2, 8), ifd0, next)) {
+        const auto* w = find_entry(ifd0, 256);
+        const auto* h = find_entry(ifd0, 257);
+        check(w && w->value == 96 && h && h->value == 48, "stereo level 0 is 96x48");
+    } else
+        check(false, "stereo IFD0 parses");
+    std::fclose(fs2);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -451,6 +735,8 @@ int main(int argc, char** argv) {
     test_round_trip();
     test_stitch(tmp);
     test_downscale(tmp);
+    test_cube360(tmp);
+    test_stereo(tmp);
 
     if (g_failures) {
         std::printf("%d failure(s)\n", g_failures);

@@ -76,7 +76,17 @@ restart.
   in the manifest; Dusklight's scene target is 8-bit RGBA, so HDR/EXR output
   is wired at the manifest level for future adapters but produces no gain on
   this one (documented in the mod log if a float format ever appears).
-- **M4**: 360/stereo capture, per-platform artifacts, version fallback matrix.
+- **M4** (done, pending in-game run with a CI artifact): 360 + stereo +
+  hardening — F12 captures six axis-aligned FOV-90 cube faces at the frozen
+  eye (`lumen stitch` composes an equirectangular panorama, `--equire N` sets
+  its width; seams land inside face overlaps); F8 captures a stereo trio
+  (left/center/right eyes shifted along the camera right axis, panel-adjustable
+  separation; stitched 1:1 side-by-side — translated eyes make resampling
+  wrong, so the paste is exact and per-eye `eye` offsets ride the manifest for
+  future redressers). Capture jobs are watchdogged (stalled readback, failing
+  tile, unreachable viewport probe all end the job with an error instead of
+  hanging or spamming); a CI matrix builds the tools on Windows/Linux/macOS
+  and produces the authoritative MSVC `.dusk` artifact on push.
 - **M5**: adapter contract v1, second game adapter.
 
 See `docs/adapter-contract.md` for how to add a new game.

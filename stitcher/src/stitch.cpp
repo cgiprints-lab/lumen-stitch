@@ -16,6 +16,7 @@
 #include <cstring>
 #include <deque>
 #include <fstream>
+#include <map>
 #include <sstream>
 
 namespace lumen::stitch {
@@ -196,6 +197,9 @@ bool load_job(const std::filesystem::path& manifest, Job& job, std::string& err)
     }
     job.version = 1;
     job.scale = *scale;
+    const auto* layout = root->find("layout");
+    if (layout && layout->as_string())
+        job.layout = *layout->as_string();
     job.master.yaw = *y;
     job.master.pitch = *p;
     job.master.fovy = *f;
@@ -239,6 +243,14 @@ bool load_job(const std::filesystem::path& manifest, Job& job, std::string& err)
         jt.h = *th;
         for (int i = 0; i < 4; ++i)
             jt.rect[i] = static_cast<uint32_t>((*rects)[i].number);
+        // Optional eye offset (stereo layouts): kept for future redressing
+        // tools; direct-copy layouts paste 1:1 and ignore it.
+        if (const auto* eye = t.find("eye"); eye && eye->as_array() && eye->as_array()->size() == 3) {
+            const auto* e = eye->as_array();
+            jt.ox = (*e)[0].number;
+            jt.oy = (*e)[1].number;
+            jt.oz = (*e)[2].number;
+        }
         job.tiles.push_back(std::move(jt));
     }
     return true;
@@ -452,18 +464,188 @@ bool composite_scaled(const Job& job, uint32_t factor, const StripFn& strip,
     return true;
 }
 
+bool composite_equire(const Job& job, uint32_t out_width, const StripFn& strip,
+    const std::function<void(uint32_t percent)>& progress, std::string& err) {
+    if (job.tiles.empty()) {
+        err = "cube360 job has no faces";
+        return false;
+    }
+    const uint32_t EW = std::max<uint32_t>(16, out_width), EH = EW / 2;
+
+    // Faces stay resident: six viewport-sized images, bounded regardless of
+    // capture resolution (a 360 job is a fixed 6 captures, not a grid).
+    struct Face {
+        double f[3], r[3], u[3];
+        double thty = 0, thtx = 0;
+        uint32_t w = 0, h = 0;
+        std::vector<uint8_t> img;
+    };
+    std::vector<Face> faces;
+    faces.reserve(job.tiles.size());
+    for (const auto& t : job.tiles) {
+        Face fc;
+        lumen::tilemath::basis(t.yaw, t.pitch, fc.f, fc.r, fc.u);
+        fc.thty = std::tan(lumen::tilemath::rad(t.fovy) / 2.0);
+        fc.thtx = fc.thty * static_cast<double>(t.w) / static_cast<double>(t.h);
+        fc.w = t.w, fc.h = t.h;
+        const auto path = job.base_dir / t.file;
+        int tw = 0, th = 0, ch = 0;
+        unsigned char* px = stbi_load(path.string().c_str(), &tw, &th, &ch, 4);
+        if (!px) {
+            err = "cannot decode face " + path.string();
+            return false;
+        }
+        if (static_cast<uint32_t>(tw) != t.w || static_cast<uint32_t>(th) != t.h) {
+            stbi_image_free(px);
+            err = "face " + path.string() + " size disagrees with the manifest";
+            return false;
+        }
+        fc.img.assign(px, px + static_cast<size_t>(tw) * static_cast<size_t>(th) * 4);
+        stbi_image_free(px);
+        faces.push_back(std::move(fc));
+    }
+
+    const double yaw = job.master.yaw;  // panorama longitude center
+    std::vector<uint8_t> out_row(static_cast<size_t>(EW) * 3);
+    for (uint64_t y = 0; y < EH; ++y) {
+        const double phi = (0.5 - (static_cast<double>(y) + 0.5) / EH) * tilemath::kPi;
+        const double cp = std::cos(phi), sp = std::sin(phi);
+        for (uint64_t x = 0; x < EW; ++x) {
+            const double lam = ((static_cast<double>(x) + 0.5) / EW * 2.0 - 1.0) * tilemath::kPi;
+            // World direction (Y-up): longitude from the capture yaw.
+            const double d[3] = {cp * std::sin(yaw + lam), sp, cp * std::cos(yaw + lam)};
+            // Owner = face whose axis is closest; its projection must also be
+            // inside the face image (it is, for axis-aligned FOV-90 faces;
+            // fall back to any face that contains the ray, else black).
+            int best = -1;
+            double best_dot = -1e9, best_px = 0, best_py = 0;
+            int fb = -1;
+            double fb_px = 0, fb_py = 0;
+            for (size_t i = 0; i < faces.size(); ++i) {
+                const Face& fc = faces[i];
+                const double den = tilemath::dot(d, fc.f);
+                if (!(den > 1e-9))
+                    continue;
+                const double mx = tilemath::dot(d, fc.r) / den;
+                const double my = tilemath::dot(d, fc.u) / den;
+                if (std::fabs(mx) > fc.thtx || std::fabs(my) > fc.thty)
+                    continue;
+                const double pxf = fc.w / 2.0 + mx * (fc.w / 2.0) / fc.thtx;
+                const double pyf = fc.h / 2.0 - my * (fc.h / 2.0) / fc.thty;
+                if (fb < 0)
+                    fb = static_cast<int>(i), fb_px = pxf, fb_py = pyf;
+                const double sc = tilemath::dot(d, fc.f);
+                if (sc > best_dot)
+                    best_dot = sc, best = static_cast<int>(i), best_px = pxf, best_py = pyf;
+            }
+            uint8_t* dst = out_row.data() + static_cast<size_t>(x) * 3;
+            const int use = best >= 0 ? best : fb;
+            if (use < 0) {
+                dst[0] = dst[1] = dst[2] = 0;
+                continue;
+            }
+            sample_tile(faces[use].img.data(), faces[use].w, faces[use].h,
+                best >= 0 ? best_px : fb_px, best >= 0 ? best_py : fb_py, dst);
+        }
+        if (!strip(y, 1, out_row.data())) {
+            err = "strip consumer failed";
+            return false;
+        }
+        if (progress)
+            progress(static_cast<uint32_t>(100ull * (y + 1) / EH));
+    }
+    return true;
+}
+
+bool composite_direct(const Job& job, const StripFn& strip,
+    const std::function<void(uint32_t percent)>& progress, std::string& err) {
+    if (job.tiles.empty()) {
+        err = "job has no tiles";
+        return false;
+    }
+    const uint32_t MW = job.master.width, MH = job.master.height;
+    if (!MW || !MH) {
+        err = "job master has no extent";
+        return false;
+    }
+    // Decoded-tile window: tiles are visited in raster order of their rects,
+    // so only tiles overlapping upcoming rows stay in memory.
+    std::map<size_t, std::vector<uint8_t>> cache;
+    std::vector<uint8_t> out_row(static_cast<size_t>(MW) * 3);
+    for (uint64_t y = 0; y < MH; ++y) {
+        std::fill(out_row.begin(), out_row.end(), uint8_t{0});
+        for (size_t i = 0; i < job.tiles.size(); ++i) {
+            const JobTile& t = job.tiles[i];
+            if (y < t.rect[1] || y >= t.rect[3])
+                continue;
+            auto it = cache.find(i);
+            if (it == cache.end()) {
+                const auto path = job.base_dir / t.file;
+                int tw = 0, th = 0, ch = 0;
+                unsigned char* px = stbi_load(path.string().c_str(), &tw, &th, &ch, 4);
+                if (!px) {
+                    err = "cannot decode tile " + path.string();
+                    return false;
+                }
+                if (static_cast<uint32_t>(tw) != t.w || static_cast<uint32_t>(th) != t.h) {
+                    stbi_image_free(px);
+                    err = "tile " + path.string() + " size disagrees with the manifest";
+                    return false;
+                }
+                std::vector<uint8_t> img(px, px + static_cast<size_t>(tw) * static_cast<size_t>(th) * 4);
+                stbi_image_free(px);
+                it = cache.emplace(i, std::move(img)).first;
+            }
+            const uint64_t ly = y - t.rect[1];
+            const uint8_t* src = it->second.data() + static_cast<size_t>(ly) * t.w * 4;
+            uint8_t* dst = out_row.data() + static_cast<size_t>(t.rect[0]) * 3;
+            const uint64_t n = t.rect[2] - t.rect[0];
+            for (uint64_t x = 0; x < n; ++x) {
+                dst[x * 3 + 0] = src[x * 4 + 0];
+                dst[x * 3 + 1] = src[x * 4 + 1];
+                dst[x * 3 + 2] = src[x * 4 + 2];
+            }
+        }
+        // Tiles fully behind this row are no longer needed.
+        for (auto it = cache.begin(); it != cache.end();) {
+            const JobTile& t = job.tiles[it->first];
+            if (t.rect[3] <= y + 1)
+                it = cache.erase(it);
+            else
+                ++it;
+        }
+        if (!strip(y, 1, out_row.data())) {
+            err = "strip consumer failed";
+            return false;
+        }
+        if (progress)
+            progress(static_cast<uint32_t>(100ull * (y + 1) / MH));
+    }
+    return true;
+}
+
 bool run(const std::filesystem::path& manifest, const Options& opt, std::string& err,
     const std::function<void(uint32_t percent)>& progress) {
     Job job;
     if (!load_job(manifest, job, err))
         return false;
 
-    const uint32_t dscale = opt.downscale ? opt.downscale : 1;
+    // Stereo ignores --downscale: its tiles have translated eyes, so the
+    // shared-eye resamplers (and their box downsample) do not apply; the
+    // 1:1 paste is the layout.
+    const uint32_t dscale = job.layout == "stereo" ? 1u : (opt.downscale ? opt.downscale : 1u);
+    const bool equire = job.layout == "cube360";
+    const bool direct = job.layout == "stereo";
     std::vector<BigTiffWriter::Level> levels;
     {
         BigTiffWriter::Level l0;
-        l0.width = (job.master.width + dscale - 1) / dscale;
-        l0.height = (job.master.height + dscale - 1) / dscale;
+        if (equire) {
+            l0.width = std::max<uint32_t>(16, opt.equire_width);
+            l0.height = l0.width / 2;
+        } else {
+            l0.width = (job.master.width + dscale - 1) / dscale;
+            l0.height = (job.master.height + dscale - 1) / dscale;
+        }
         l0.tileW = l0.tileH = 256;
         levels.push_back(l0);
         while (std::max(levels.back().width, levels.back().height) > opt.min_mip_edge) {
@@ -504,8 +686,11 @@ bool run(const std::filesystem::path& manifest, const Options& opt, std::string&
             feeder.feed(0, y + r, rgb + static_cast<size_t>(r) * levels[0].width * 3);
         return true;
     };
-    const bool ok = dscale == 1 ? composite(job, sink_rows, progress, err)
-                                : composite_scaled(job, dscale, sink_rows, progress, err);
+    const bool ok = equire   ? composite_equire(job, std::max<uint32_t>(16, opt.equire_width),
+                                     sink_rows, progress, err)
+                : direct    ? composite_direct(job, sink_rows, progress, err)
+                : dscale == 1 ? composite(job, sink_rows, progress, err)
+                              : composite_scaled(job, dscale, sink_rows, progress, err);
     feeder.finish();
     if (!tiff.close(err))
         return false;

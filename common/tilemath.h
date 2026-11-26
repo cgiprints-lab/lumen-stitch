@@ -140,6 +140,31 @@ inline Tile make_tile(const Master& m, uint32_t x0, uint32_t y0, uint32_t x1, ui
     return t;
 }
 
+// --- cube 360 capture model ---------------------------------------------------
+// Six axis-aligned faces around the capture eye (Ansel's 360 contract: cube
+// faces at FOV 90, fixed pivot): four at the horizon (F/R/B/L: pitch 0, yaw
+// offset 0/+90/+180/-90 from the capture yaw) plus U/D at pitch +/-90. Each
+// face is FOV 90 VERTICAL at the native viewport aspect, so the horizontal
+// extent is wider than 90 and neighbours overlap; the equirectangular
+// compositor assigns each panorama pixel to the face whose axis is closest,
+// which puts every seam inside an overlap where both faces genuinely saw the
+// same rays. Atlas slots (4 x 2) are manifest bookkeeping only.
+struct FacePose {
+    double yaw;   // radians
+    double pitch; // radians
+    int row, col;
+};
+inline constexpr double kCube360Fovy = 90.0; // degrees, vertical
+
+inline void cube360_faces(double yaw, FacePose out[6]) {
+    out[0] = {yaw, 0.0, 0, 1};               // front
+    out[1] = {yaw + rad(90.0), 0.0, 0, 0};   // right
+    out[2] = {yaw + rad(180.0), 0.0, 0, 3};  // back
+    out[3] = {yaw - rad(90.0), 0.0, 0, 2};   // left
+    out[4] = {yaw, rad(90.0), 1, 1};         // up
+    out[5] = {yaw, -rad(90.0), 1, 3};        // down
+}
+
 // Precomputed linear map from continuous master pixel coords to tile pixels:
 // the master ray through pixel (x, y) is d = A + B*x + C*y, and the tile
 // projection divides through-linearly, so tile px/py are ratios of linear

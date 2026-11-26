@@ -3,38 +3,49 @@ name: build
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 jobs:
-  manager:
-    name: Lumen Manager (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+  # The standalone tools: manager CLI + gigapixel stitcher, with the seam /
+  # downsample / 360 / stereo acceptance tests, on every supported platform.
+  tools:
     strategy:
+      fail-fast: false
       matrix:
         os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: Configure
+      - name: Configure core
         run: cmake -S core -B build/core
+      - name: Configure stitcher
+        run: cmake -S stitcher -B build/stitcher
       - name: Build
-        run: cmake --build build/core
-      - uses: actions/upload-artifact@v4
-        with:
-          name: lumen-${{ matrix.os }}
-          path: build/core/lumen*
+        run: |
+          cmake --build build/core --config RelWithDebInfo
+          cmake --build build/stitcher --config RelWithDebInfo
+      - name: Acceptance tests
+        run: build/stitcher/RelWithDebInfo/seam_test "$RUNNER_TEMP"
+        shell: bash
+        if: matrix.os == 'windows-latest'
+      - name: Acceptance tests
+        run: build/stitcher/seam_test "$RUNNER_TEMP"
+        shell: bash
+        if: matrix.os != 'windows-latest'
 
-  dusklight-mod:
-    name: Dusklight integration (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [windows-latest, ubuntu-latest, macos-latest]
+  # The in-game mod against the Dusklight SDK. MSVC on Windows is the
+  # authoritative artifact (MinGW cannot emit the loadable .dusk metadata);
+  # macOS/Linux compile-check the source only when the SDK supports them.
+  mod-windows:
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - name: Configure
-        run: cmake -S adapters/dusklight/mod -B build/mod -G Ninja
+        run: cmake -S adapters/dusklight/mod -B build/mod
       - name: Build
-        run: cmake --build build/mod --target lumen_photo
-      - uses: actions/upload-artifact@v4
+        run: cmake --build build/mod --config RelWithDebInfo
+      - name: Upload .dusk
+        uses: actions/upload-artifact@v4
         with:
-          name: lumen_photo-${{ matrix.os }}
-          path: build/mod/mods/lumen_photo.dusk
+          name: lumen_photo-windows
+          path: build/mod/mods/*.dusk

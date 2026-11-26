@@ -19,7 +19,7 @@
 // gracefully (log + skip) when a name is missing or ambiguous.
 //
 // Controls (Windows; panel buttons cover every action on other platforms):
-//   F9  enter / exit photo mode   F10 capture (1x)   F11 gigapixel job
+//   F9 photo mode   F10 capture 1x   F11 gigapixel   F12 360 pano   F8 stereo trio
 //   WASD move, Q/E down/up, arrows look, Shift boost, PgUp/PgDn field of view.
 #include "mods/api.h"
 
@@ -122,12 +122,14 @@ struct PhotoState {
     float pitch = 0; // radians
     float fovy = 90; // degrees
     float fov_override = 0; // per-tile FOV during a gigapixel job (0 = none)
+    float eye_off[3] = {0, 0, 0}; // per-tile eye shift (stereo); 0 for grid/360
 };
 PhotoState g_photo;
 
 struct CaptureState {
     CapturePhase phase = CAPTURE_NONE;
     int settle_left = 0;
+    int stall_frames = 0;        // watchdog: frames since begin_capture
     uint32_t width = 0;
     uint32_t height = 0;
     bool for_job = false;          // this capture is a gigapixel tile
@@ -150,13 +152,16 @@ struct JobTileDef {
     int row = 0, col = 0;
     double yaw = 0, pitch = 0; // radians (pose applied to the operator)
     double fovy = 90;          // degrees
+    double ox = 0, oy = 0, oz = 0; // eye offset in world units (stereo only)
     uint32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0; // master-pixel rect owned
     std::vector<char> name;    // utf-8 tile PNG name
 };
 struct JobState {
+    enum Kind { GRID, CUBE360, STEREO } kind = GRID;
     bool active = false;
     bool build_pending = false; // waiting on the viewport-size probe
-    uint32_t S = 0;             // tiles per side, frozen at job start
+    int probe_frames = 0;       // probe watchdog (frames while build_pending)
+    uint32_t S = 0;             // tiles per side, frozen at job start (GRID)
     uint32_t vw = 0, vh = 0;    // scene color size (probe)
     WGPUTextureFormat color_format = WGPUTextureFormat_Undefined; // probe (see manifest)
     uint64_t id = 0;            // timestamp shared by tile names + manifest
@@ -205,6 +210,7 @@ ConfigVarHandle g_var_capture_scale = 0;
 ConfigVarHandle g_var_settle_frames = 0;
 ConfigVarHandle g_var_move_speed = 0;
 ConfigVarHandle g_var_look_speed = 0;
+ConfigVarHandle g_var_stereo_ipd = 0;
 ConfigVarHandle g_var_photo_fov = 0;
 ConfigVarHandle g_var_capture_folder = 0;
 ConfigVarHandle g_var_strip_haze = 0;
@@ -324,9 +330,11 @@ const char* status_label() {
     static char buf[128];
     if (g_job.active) {
         if (g_job.build_pending)
-            return "gigapixel: measuring viewport...";
-        std::snprintf(buf, sizeof(buf), "gigapixel: tile %zu/%zu", g_job.idx + 1,
-            g_job.tiles.size());
+            return "capture: measuring viewport...";
+        const char* what = g_job.kind == JobState::CUBE360   ? "360: face %zu/%zu"
+                           : g_job.kind == JobState::STEREO   ? "stereo: view %zu/%zu"
+                                                              : "gigapixel: tile %zu/%zu";
+        std::snprintf(buf, sizeof(buf), what, g_job.idx + 1, g_job.tiles.size());
         return buf;
     }
     if (!g_photo.active)
@@ -364,13 +372,16 @@ bool photo_operate(ModContext*, CameraOperatorState* state, void*) {
             g_photo.fovy = state->fovy;
         g_photo.seeded = true;
     }
-    state->eye[0] = g_photo.eye[0];
-    state->eye[1] = g_photo.eye[1];
-    state->eye[2] = g_photo.eye[2];
+    const float ex = g_photo.eye[0] + g_photo.eye_off[0];
+    const float ey = g_photo.eye[1] + g_photo.eye_off[1];
+    const float ez = g_photo.eye[2] + g_photo.eye_off[2];
+    state->eye[0] = ex;
+    state->eye[1] = ey;
+    state->eye[2] = ez;
     const float cp = std::cosf(g_photo.pitch);
-    state->center[0] = g_photo.eye[0] + cp * std::sinf(g_photo.yaw);
-    state->center[1] = g_photo.eye[1] + std::sinf(g_photo.pitch);
-    state->center[2] = g_photo.eye[2] + cp * std::cosf(g_photo.yaw);
+    state->center[0] = ex + cp * std::sinf(g_photo.yaw);
+    state->center[1] = ey + std::sinf(g_photo.pitch);
+    state->center[2] = ez + cp * std::cosf(g_photo.yaw);
     state->fovy = g_photo.fov_override > 0.0f ? g_photo.fov_override : g_photo.fovy;
     state->bank_degrees = 0;
     return true;
@@ -404,6 +415,7 @@ ModResult begin_capture(const char* name_override, bool for_job) {
     if (g_capture.phase != CAPTURE_NONE)
         return MOD_OK; // one shot at a time
     g_capture.settle_left = static_cast<int>(cfg_int(g_var_settle_frames, 2));
+    g_capture.stall_frames = 0;
     g_capture.for_job = for_job;
     g_capture.name.clear();
     if (name_override) {
@@ -420,7 +432,7 @@ ModResult request_capture() {
         return MOD_ERROR;
     }
     if (g_job.active) {
-        push_photo_toast("Lumen Photo Mode", "A gigapixel job is running.", "warning");
+        push_photo_toast("Lumen Photo Mode", "A capture job is running.", "warning");
         return MOD_OK;
     }
     return begin_capture(nullptr, false);
@@ -437,25 +449,64 @@ void abort_job(bool notify) {
     g_job.idx = 0;
     g_job.json.clear();
     g_photo.fov_override = 0;
+    g_photo.eye_off[0] = g_photo.eye_off[1] = g_photo.eye_off[2] = 0.0f;
     if (g_capture.phase != CAPTURE_NONE) {
         reset_capture_buffers();
         g_capture.phase = CAPTURE_NONE;
     }
     if (notify)
-        push_photo_toast("Lumen Photo Mode", "Gigapixel job canceled.", "warning");
+        push_photo_toast("Lumen Photo Mode", "Capture job canceled.", "warning");
 }
 
-void start_gigapixel() {
+// A capture attempt failed outright. For job tiles this ends the job: the
+// same tile would otherwise be re-armed every frame (device-lost style
+// failures never heal), spamming toasts and never completing. The manifest
+// is only written on full completion, so an aborted job stays stitchable
+// only from its complete tile set - never from a silently partial one.
+void fail_capture(const char* why) {
+    const bool for_job = g_capture.for_job;
+    reset_capture_buffers();
+    g_capture.phase = CAPTURE_NONE;
+    g_capture.for_job = false;
+    push_photo_toast("Lumen Photo Mode", why, "error");
+    if (for_job)
+        abort_job(false);
+}
+
+// Guard shared by every multi-part capture kind.
+bool job_startable() {
     if (!g_photo.active || g_job.active || g_capture.phase != CAPTURE_NONE) {
         if (!g_photo.active)
             push_photo_toast("Lumen Photo Mode", "Enter photo mode first (F9).", "warning");
-        return;
+        return false;
     }
     if (!folder_ok()) {
         push_photo_toast("Lumen Photo Mode", "Set a capture folder in the Lumen panel first.",
             "warning");
-        return;
+        return false;
     }
+    return true;
+}
+
+// Shared kickoff: everything is decided after the viewport-size probe.
+void begin_job(JobState::Kind kind, uint32_t S) {    g_job.active = true;
+    g_job.build_pending = true; // need the scene color size before aiming tiles
+    g_job.probe_frames = 0;
+    g_job.kind = kind;
+    g_job.S = S;
+    g_job.tiles.clear();
+    g_job.idx = 0;
+    g_job.json.clear();
+    g_job.id = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+    strip_begin(); // hold screen-space/temporal effects off for the whole job
+}
+
+void start_gigapixel() {
+    if (!job_startable())
+        return;
     const int64_t S = cfg_int(g_var_capture_scale, 4);
     if (S < 1)
         return;
@@ -468,22 +519,133 @@ void start_gigapixel() {
         push_photo_toast("Lumen Photo Mode",
             "Over 16x uses the opt-in high-cost path: thousands of frames.", "info");
     }
-    g_job.active = true;
-    g_job.build_pending = true; // need the scene color size before aiming tiles
-    g_job.S = static_cast<uint32_t>(S);
-    g_job.tiles.clear();
-    g_job.idx = 0;
-    g_job.json.clear();
-    g_job.id = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch())
-            .count());
-    strip_begin(); // hold screen-space/temporal effects off for the whole job
+    begin_job(JobState::GRID, static_cast<uint32_t>(S));
     mods::log::info("lumen: gigapixel job {} started ({}x{} tiles)", g_job.id, S, S);
+}
+
+// Ansel's 360: six axis-aligned FOV-90 faces at the frozen eye (fixed pivot),
+// stitched offline into an equirectangular panorama by `lumen stitch`.
+void start_360() {
+    if (!job_startable())
+        return;
+    begin_job(JobState::CUBE360, 0);
+    mods::log::info("lumen: 360 job {} started (6 faces)", g_job.id);
+}
+
+// Ansel's stereo: left / center / right views of the same frozen scene, eyes
+// shifted along the camera right axis by +/- ipd/2 (fixed convergence point).
+void start_stereo() {
+    if (!job_startable())
+        return;
+    begin_job(JobState::STEREO, 0);
+    mods::log::info("lumen: stereo job {} started (3 views)", g_job.id);
+}
+
+// Dusklight's scene target is fixed RGBA8Unorm (aurora g_efbFormat), so the
+// 8-bit readback loses nothing; record the probed format so the stitcher and
+// future adapters can tell, and flag float formats as a known gap.
+void warn_if_not_rgba8() {
+    if (g_job.color_format != WGPUTextureFormat_RGBA8Unorm)
+        mods::log::warn("lumen: scene color format {} - capture quantizes to LDR 8-bit; "
+                        "HDR readback not wired for this adapter",
+            static_cast<unsigned>(g_job.color_format));
+}
+
+// Six cube faces (tilemath::cube360_faces - shared with the stitcher). The
+// manifest master block carries the panorama center (capture yaw) plus the
+// viewport size; width/height describe the 4x2 atlas slots, which are
+// bookkeeping only for this layout.
+void build_cube_tiles(uint32_t vw, uint32_t vh) {
+    g_job.vw = vw;
+    g_job.vh = vh;
+    warn_if_not_rgba8();
+    tilemath::FacePose fp[6];
+    tilemath::cube360_faces(g_photo.yaw, fp);
+    char name[160];
+    for (const tilemath::FacePose& f : fp) {
+        JobTileDef def;
+        def.row = f.row;
+        def.col = f.col;
+        def.yaw = f.yaw;
+        def.pitch = f.pitch;
+        def.fovy = tilemath::kCube360Fovy;
+        def.x0 = static_cast<uint32_t>(f.col) * vw;
+        def.y0 = static_cast<uint32_t>(f.row) * vh;
+        def.x1 = def.x0 + vw;
+        def.y1 = def.y0 + vh;
+        std::snprintf(name, sizeof(name), "lumen-%" PRIu64 "-r%u-c%u.png", g_job.id,
+            static_cast<unsigned>(f.row), static_cast<unsigned>(f.col));
+        def.name.assign(name, name + std::strlen(name) + 1);
+        g_job.tiles.push_back(std::move(def));
+    }
+    char head[320];
+    std::snprintf(head, sizeof(head),
+        "{\"lumenJob\":1,\"layout\":\"cube360\",\"scale\":1,\"colorFormat\":%u,"
+        "\"master\":{\"yaw\":%.9g,\"pitch\":0,\"fovy\":%.9g,\"vw\":%" PRIu32 ",\"vh\":%" PRIu32
+        ",\"width\":%" PRIu32 ",\"height\":%" PRIu32 "},\"tiles\":[",
+        static_cast<unsigned>(g_job.color_format), g_photo.yaw, tilemath::kCube360Fovy, vw, vh,
+        4 * vw, 2 * vh);
+    g_job.json = head;
+    g_job.build_pending = false;
+    mods::log::info("lumen: 360 job {} aiming 6 faces at viewport {}x{}", g_job.id, vw, vh);
+}
+
+// Stereo trio: left/center/right at native FOV, side-by-side slots on one
+// master row. L/R eyes shift along the camera RIGHT axis by +/- ipd/2; the
+// master block records the center view, each tile its own eye offset, so the
+// stitcher lays them out 1:1 and future tools can redress (anaglyph, shift).
+void build_stereo_tiles(uint32_t vw, uint32_t vh) {
+    g_job.vw = vw;
+    g_job.vh = vh;
+    warn_if_not_rgba8();
+    const double ipd = cfg_float(g_var_stereo_ipd, 1.0);
+    const double yaw = g_photo.yaw;
+    // Camera right in world axes (Y-up): forward is (sin yaw, 0, cos yaw).
+    const double rx = std::cos(yaw), rz = -std::sin(yaw);
+    const double half = ipd * 0.5;
+    // row 0: left, center, right
+    const double signs[3] = {-1.0, 0.0, 1.0};
+    char name[160];
+    for (int i = 0; i < 3; ++i) {
+        JobTileDef def;
+        def.row = 0;
+        def.col = i;
+        def.yaw = yaw;
+        def.pitch = g_photo.pitch;
+        def.fovy = g_photo.fovy;
+        def.ox = signs[i] * half * rx;
+        def.oz = signs[i] * half * rz;
+        def.x0 = static_cast<uint32_t>(i) * vw;
+        def.y0 = 0;
+        def.x1 = def.x0 + vw;
+        def.y1 = vh;
+        std::snprintf(name, sizeof(name), "lumen-%" PRIu64 "-r0-c%u.png", g_job.id,
+            static_cast<unsigned>(i));
+        def.name.assign(name, name + std::strlen(name) + 1);
+        g_job.tiles.push_back(std::move(def));
+    }
+    char head[320];
+    std::snprintf(head, sizeof(head),
+        "{\"lumenJob\":1,\"layout\":\"stereo\",\"scale\":1,\"colorFormat\":%u,"
+        "\"master\":{\"yaw\":%.9g,\"pitch\":%.9g,\"fovy\":%.9g,\"vw\":%" PRIu32 ",\"vh\":%" PRIu32
+        ",\"width\":%" PRIu32 ",\"height\":%" PRIu32 "},\"tiles\":[",
+        static_cast<unsigned>(g_job.color_format), yaw, static_cast<double>(g_photo.pitch),
+        static_cast<double>(g_photo.fovy), vw, vh, 3 * vw, vh);
+    g_job.json = head;
+    g_job.build_pending = false;
+    mods::log::info("lumen: stereo job {} at ipd {} viewport {}x{}", g_job.id, ipd, vw, vh);
 }
 
 // Build the tile grid once the scene color size is known (probe frame).
 void build_job_tiles(uint32_t vw, uint32_t vh) {
+    if (g_job.kind == JobState::CUBE360) {
+        build_cube_tiles(vw, vh);
+        return;
+    }
+    if (g_job.kind == JobState::STEREO) {
+        build_stereo_tiles(vw, vh);
+        return;
+    }
     const uint32_t S0 = g_job.S;
     if (!S0) {
         abort_job(true);
@@ -517,14 +679,7 @@ void build_job_tiles(uint32_t vw, uint32_t vh) {
     m.height = vh * S;
     g_job.vw = vw;
     g_job.vh = vh;
-    // The readback shader quantizes normalized samples to 8-bit. Dusklight's
-    // scene target is fixed RGBA8Unorm (aurora g_efbFormat), so that loses
-    // nothing here; record the probed format so the stitcher and future HDR
-    // adapters can tell, and flag float formats as a known gap.
-    if (g_job.color_format != WGPUTextureFormat_RGBA8Unorm)
-        mods::log::warn("lumen: scene color format {} - capture quantizes to LDR 8-bit; "
-                        "HDR readback not wired for this adapter",
-            static_cast<unsigned>(g_job.color_format));
+    warn_if_not_rgba8();
     char name[160];
     for (uint32_t r = 0; r < S; ++r) {
         for (uint32_t c = 0; c < S; ++c) {
@@ -567,19 +722,23 @@ void advance_job() {
     g_photo.yaw = static_cast<float>(t.yaw);
     g_photo.pitch = static_cast<float>(t.pitch);
     g_photo.fov_override = static_cast<float>(t.fovy);
+    // Eye stays put for grid/360 (pure rotation); stereo shifts it per view.
+    g_photo.eye_off[0] = static_cast<float>(t.ox);
+    g_photo.eye_off[1] = static_cast<float>(t.oy);
+    g_photo.eye_off[2] = static_cast<float>(t.oz);
     begin_capture(t.name.data(), true);
 }
 
 // Manifest entry for the tile that just completed.
 void record_job_tile() {
     const JobTileDef& t = g_job.tiles[g_job.idx];
-    char entry[320];
+    char entry[448];
     std::snprintf(entry, sizeof(entry),
         "%s{\"file\":\"%s\",\"row\":%d,\"col\":%d,\"yaw\":%.9g,\"pitch\":%.9g,"
-        "\"fovy\":%.9g,\"width\":%" PRIu32 ",\"height\":%" PRIu32 ",\"rect\":[%" PRIu32
-        ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 "]}",
+        "\"fovy\":%.9g,\"width\":%" PRIu32 ",\"height\":%" PRIu32 ",\"eye\":[%.9g,%.9g,%.9g],"
+        "\"rect\":[%" PRIu32 ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 "]}",
         g_job.idx ? "," : "", t.name.data(), t.row, t.col, t.yaw, t.pitch, t.fovy, g_capture.width,
-        g_capture.height, t.x0, t.y0, t.x1, t.y1);
+        g_capture.height, t.ox, t.oy, t.oz, t.x0, t.y0, t.x1, t.y1);
     g_job.json += entry;
     ++g_job.idx;
     if (g_job.idx < g_job.tiles.size())
@@ -600,22 +759,38 @@ void record_job_tile() {
     }
     const uint64_t id = g_job.id;
     const size_t tiles = g_job.tiles.size();
+    const auto kind = g_job.kind;
     g_job.active = false;
     strip_end();
     g_job.tiles.clear();
     g_job.json.clear();
     g_photo.fov_override = 0;
+    g_photo.eye_off[0] = g_photo.eye_off[1] = g_photo.eye_off[2] = 0.0f;
     if (wrote) {
         char body[256];
         std::snprintf(body, sizeof(body),
-            "Gigapixel done: %zu tiles + lumen-%" PRIu64
-            ".json.\nStitch with: lumen stitch lumen-%" PRIu64 ".json",
-            tiles, id, id);
+            "%s done: %zu %s + lumen-%" PRIu64 ".json.\nStitch with: lumen stitch lumen-%" PRIu64
+            ".json",
+            kind == JobState::CUBE360   ? "360 panorama"
+                : kind == JobState::STEREO ? "Stereo"
+                                           : "Gigapixel",
+            tiles,
+            kind == JobState::CUBE360   ? "faces"
+                : kind == JobState::STEREO ? "views"
+                                           : "tiles",
+            id, id);
         push_photo_toast("Lumen Photo Mode", body);
-        mods::log::info("lumen: gigapixel job {} complete ({} tiles)", id, tiles);
+        mods::log::info("lumen: {} job {} complete ({} parts)",
+            kind == JobState::CUBE360   ? "360"
+                : kind == JobState::STEREO ? "stereo"
+                                           : "gigapixel",
+            id, tiles);
     } else {
         push_photo_toast("Lumen Photo Mode",
-            "Gigapixel tiles saved but the manifest could not be written.", "error");
+            kind == JobState::CUBE360   ? "360 faces saved but the manifest could not be written."
+                : kind == JobState::STEREO ? "Stereo views saved but the manifest could not be written."
+                                           : "Gigapixel tiles saved but the manifest could not be written.",
+            "error");
     }
 }
 
@@ -672,11 +847,18 @@ bool key_held(int vk) {
     return (GetAsyncKeyState(vk) & 0x8000) != 0;
 }
 
+bool g_prev_f8 = false;
 bool g_prev_f9 = false;
 bool g_prev_f10 = false;
 bool g_prev_f11 = false;
+bool g_prev_f12 = false;
 
 void poll_hotkeys() {
+    const bool f8 = key_held(VK_F8);
+    if (f8 && !g_prev_f8)
+        start_stereo();
+    g_prev_f8 = f8;
+
     const bool f9 = key_held(VK_F9);
     if (f9 && !g_prev_f9) {
         if (g_photo.active)
@@ -695,6 +877,11 @@ void poll_hotkeys() {
     if (f11 && !g_prev_f11)
         start_gigapixel();
     g_prev_f11 = f11;
+
+    const bool f12 = key_held(VK_F12);
+    if (f12 && !g_prev_f12)
+        start_360();
+    g_prev_f12 = f12;
 }
 
 void apply_flight_input(float dt) {
@@ -851,8 +1038,7 @@ void issue_capture(WGPUDevice device) {
     resolveDesc.color = true;
     GfxResolvedTargets targets = GFX_RESOLVED_TARGETS_INIT;
     if (svc_gfx->resolve_pass(mod_ctx, &resolveDesc, &targets) != MOD_OK || !targets.color) {
-        g_capture.phase = CAPTURE_NONE;
-        push_photo_toast("Lumen Photo Mode", "Capture failed: no scene color snapshot.", "error");
+        fail_capture("Capture failed: no scene color snapshot.");
         return;
     }
     const uint32_t w = targets.width;
@@ -860,7 +1046,7 @@ void issue_capture(WGPUDevice device) {
     const uint32_t bytes = w * h * 4u;
     ensure_pipeline(device);
     if (!g_capture.pipeline) {
-        g_capture.phase = CAPTURE_NONE;
+        fail_capture("Capture failed: compute pipeline unavailable.");
         return;
     }
 
@@ -876,9 +1062,7 @@ void issue_capture(WGPUDevice device) {
         g_capture.storage = wgpuDeviceCreateBuffer(device, &bd);
     }
     if (!g_capture.staging || !g_capture.storage) {
-        reset_capture_buffers();
-        g_capture.phase = CAPTURE_NONE;
-        push_photo_toast("Lumen Photo Mode", "Capture failed: buffer allocation failed.", "error");
+        fail_capture("Capture failed: buffer allocation failed.");
         return;
     }
     // Dims ride the frame's shared uniform stream; binding 2 resolves to that
@@ -886,18 +1070,14 @@ void issue_capture(WGPUDevice device) {
     const uint32_t dims[4] = {w, h, 0, 0};
     GfxRange uniformRange = {};
     if (svc_gfx->push_uniform(mod_ctx, dims, sizeof(dims), &uniformRange) != MOD_OK) {
-        reset_capture_buffers();
-        g_capture.phase = CAPTURE_NONE;
-        push_photo_toast("Lumen Photo Mode", "Capture failed: uniform stream rejected.", "error");
+        fail_capture("Capture failed: uniform stream rejected.");
         return;
     }
 
     ReadbackPayload payload{targets.color, g_capture.storage, g_capture.staging, bytes,
         uniformRange.offset, w, h};
     if (svc_gfx->push_compute(mod_ctx, g_compute_type, &payload, sizeof(payload)) != MOD_OK) {
-        reset_capture_buffers();
-        g_capture.phase = CAPTURE_NONE;
-        push_photo_toast("Lumen Photo Mode", "Capture failed: compute task rejected.", "error");
+        fail_capture("Capture failed: compute task rejected.");
         return;
     }
     g_capture.width = w;
@@ -1005,6 +1185,10 @@ void on_frame_before_hud(ModContext*, const GfxStageContext*, void*) {
             // Views from resolve_pass are borrowed for this callback only.
             g_job.color_format = targets.color_format;
             build_job_tiles(targets.width, targets.height);
+        } else if (++g_job.probe_frames > 300) {
+            abort_job(false);
+            push_photo_toast("Lumen Photo Mode",
+                "Capture job canceled: viewport size never became available.", "error");
         }
         return;
     }
@@ -1044,6 +1228,14 @@ void on_capture_pressed(ModContext*, void*) {
 
 void on_gigapixel_pressed(ModContext*, void*) {
     start_gigapixel();
+}
+
+void on_360_pressed(ModContext*, void*) {
+    start_360();
+}
+
+void on_stereo_pressed(ModContext*, void*) {
+    start_stereo();
 }
 
 void on_folder_picked(ModContext*, ModResult status, const char* const* locations, uint32_t count,
@@ -1092,6 +1284,22 @@ ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
                          "sub-frustum, then stitch offline: lumen stitch <manifest.json>.";
     gigapixel.on_pressed = on_gigapixel_pressed;
     svc_ui->pane_add_control(mod_ctx, panel, &gigapixel, nullptr);
+
+    UiControlDesc pano = UI_CONTROL_DESC_INIT;
+    pano.kind = UI_CONTROL_BUTTON;
+    pano.label = "Capture 360 panorama (six faces)";
+    pano.help_rml = "Six axis-aligned faces at the frozen eye; stitch offline into an "
+                    "equirectangular panorama: lumen stitch <manifest.json>.";
+    pano.on_pressed = on_360_pressed;
+    svc_ui->pane_add_control(mod_ctx, panel, &pano, nullptr);
+
+    UiControlDesc stereo = UI_CONTROL_DESC_INIT;
+    stereo.kind = UI_CONTROL_BUTTON;
+    stereo.label = "Capture stereo trio (left / center / right)";
+    stereo.help_rml = "Three views at the frozen eye with shifted eyes; stitched into one "
+                      "side-by-side image: lumen stitch <manifest.json>.";
+    stereo.on_pressed = on_stereo_pressed;
+    svc_ui->pane_add_control(mod_ctx, panel, &stereo, nullptr);
 
     UiControlDesc folder = UI_CONTROL_DESC_INIT;
     folder.kind = UI_CONTROL_BUTTON;
@@ -1156,6 +1364,18 @@ ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
     fov.suffix = " deg";
     svc_ui->pane_add_control(mod_ctx, panel, &fov, nullptr);
 
+    UiControlDesc ipd = UI_CONTROL_DESC_INIT;
+    ipd.kind = UI_CONTROL_NUMBER;
+    ipd.label = "Stereo eye separation";
+    ipd.help_rml = "Distance between the left and right capture eyes for stereo jobs, in world "
+                   "units. Larger is stronger 3D but harder to fuse.";
+    ipd.binding = UI_BINDING_CONFIG_VAR;
+    ipd.config_var = g_var_stereo_ipd;
+    ipd.min = 0.01;
+    ipd.max = 20;
+    ipd.suffix = " u";
+    svc_ui->pane_add_control(mod_ctx, panel, &ipd, nullptr);
+
     svc_ui->pane_add_section(mod_ctx, panel, "Gigapixel consistency");
     struct StripToggleDesc {
         const char* label;
@@ -1203,6 +1423,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     g_var_settle_frames = register_var_typed("settleFrames", CONFIG_VAR_INT, 2, 0);
     g_var_move_speed = register_var_typed("moveSpeed", CONFIG_VAR_FLOAT, 0, 20.0);
     g_var_look_speed = register_var_typed("lookSpeed", CONFIG_VAR_FLOAT, 0, 45.0);
+    g_var_stereo_ipd = register_var_typed("stereoIpd", CONFIG_VAR_FLOAT, 0, 1.0);
     g_var_photo_fov = register_var_typed("photoFov", CONFIG_VAR_FLOAT, 0, 90.0);
     g_var_capture_folder = register_var_typed("captureFolder", CONFIG_VAR_STRING, 0, 0);
     cfg_string(g_var_capture_folder, g_folder_location, sizeof(g_folder_location));
@@ -1261,6 +1482,12 @@ MOD_EXPORT ModResult mod_update(ModError* error) {
     (void)error;
     poll_hotkeys();
     apply_flight_input(1.0f / 60.0f);
+
+    // Stall watchdog: a capture whose map never completes (lost device,
+    // wedged queue) must not pin photo mode or a job forever. Generous at
+    // any plausible frame rate; PNG encode is synchronous and far faster.
+    if (g_capture.phase != CAPTURE_NONE && ++g_capture.stall_frames > 900)
+        fail_capture("Capture stalled: the GPU readback never completed.");
 
     if (g_capture.phase == CAPTURE_WAIT_SETTLE && g_capture.settle_left > 0)
         g_capture.settle_left--;
