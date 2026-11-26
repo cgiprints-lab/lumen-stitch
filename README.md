@@ -63,6 +63,11 @@ See `docs/adapter-contract.md` for how to add a new game.
 
 ## Notes
 
+- **Toolchains**: MSVC (CI matrix) and clang-cl are the supported Windows
+  compilers for the Dusklight integration — its mod metadata lives in MSVC PE
+  sections (`modmeta$a$d$z`). MinGW compiles the mod only as a local
+  compile-check (see the shim in `mod/src/mod.cpp`); MinGW bundles are not
+  loadable. Linux/macOS builds use native ELF/Mach-O sections normally.
 - NVIDIA's original Ansel SDK (UE/Unity) repos are gone from GitHub; the
   integration contract implemented here is rebuilt from NVIDIA's public GDC
   2017 material on Ansel (session model, capture/settle latency,
