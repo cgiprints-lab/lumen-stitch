@@ -59,6 +59,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <new>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -718,12 +719,50 @@ void start_auto_stitch(uint64_t job_id) {
     g_stitch_running = true;
     g_stitch_percent = 0;
     g_stitch_worker = std::thread([manifest, job_id] {
+        // Nothing that can throw may escape this thread. This worker is the
+        // one place the mod runs outside the loader's per-call exception
+        // guard, and an uncaught bad_alloc (stitching a 1.4 GB BigTIFF while
+        // the game streams an area load competes for commit) lands in
+        // std::terminate: measured 2026-11-26 15:14:49, STATUS_FATAL_APP_EXIT
+        // the second a gigapixel stitch began mid scene-load, while the
+        // identical job stitched fine while the game was idle. The tiles and
+        // manifest are already on disk, so a caught failure is recoverable.
         lumen::stitch::Options opt;
         opt.out = manifest;
         opt.out.replace_extension(".tiff");
         std::string err;
-        const bool ok = lumen::stitch::run(manifest, opt, err,
-            [](uint32_t p) { g_stitch_percent = p; });
+        bool ok = false;
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            try {
+                ok = lumen::stitch::run(manifest, opt, err,
+                    [](uint32_t p) { g_stitch_percent = p; });
+                break;
+            } catch (const std::bad_alloc&) {
+                if (attempt == 0) {
+                    mods::log::warn("lumen: stitch job {} hit a memory wall, retrying", job_id);
+                    std::this_thread::sleep_for(std::chrono::seconds(5));
+                    err.clear();
+                    continue;
+                }
+                err = "Not enough free memory to stitch - the parts are saved. "
+                      "Close other programs and run: lumen stitch lumen-" +
+                      std::to_string(job_id) + ".json";
+            } catch (const std::exception& e) {
+                err = std::string("Stitch stopped: ") + e.what() +
+                      " - the parts are saved; run lumen stitch on the manifest.";
+                break;
+            } catch (...) {
+                err = "Stitch stopped by an unknown error - the parts are saved; "
+                      "run lumen stitch on the manifest.";
+                break;
+            }
+        }
+        if (!ok) {
+            // Do not leave a truncated BigTIFF that looks complete.
+            std::error_code ec;
+            std::filesystem::remove(opt.out, ec);
+            mods::log::warn("lumen: stitch job {} failed: {}", job_id, err);
+        }
         std::lock_guard lock(g_stitch_mtx);
         g_stitch_done = ok ? opt.out.filename().string() : err;
         g_stitch_done_ok = ok;

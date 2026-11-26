@@ -129,6 +129,72 @@ bool load_cols(const std::string& path, std::vector<unsigned char> cols[3], doub
     return true;
 }
 
+// Edge forensics: for the left/right N-pixel columns, report per-band mean
+// luma and the share of pixels far from that band mean. A dithered garbage
+// column lights up as high-activity bands against a clean neighbour strip.
+void edge_report(const std::string& path, int n) {
+    int w = 0, h = 0, ch = 0;
+    unsigned char* px = stbi_load(path.c_str(), &w, &h, &ch, 3);
+    if (!px) {
+        std::printf("%s: load failed (%s)\n", path.c_str(), stbi_failure_reason());
+        return;
+    }
+    std::printf("edges %s (%dx%d), strip=%d px\n", path.c_str(), w, h, n);
+    const int bands = 16, bh = h / bands;
+    for (int side = 0; side < 2; ++side) {
+        const int xs = side == 0 ? 0 : w - n;       // strip
+        const int xin = side == 0 ? n + 4 : w - 2 * n - 4;  // clean comparator
+        std::printf("  %s edge, band(mean_luma, %%far): ", side == 0 ? "left" : "right");
+        for (int b = 0; b < bands; ++b) {
+            double lum = 0, far = 0, lum_in = 0, far_in = 0;
+            long cnt = 0, cnt_in = 0;
+            for (int y = b * bh; y < (b + 1) * bh && y < h; ++y)
+                for (int x = xs; x < xs + n; ++x) {
+                    const size_t o = (size_t(y) * size_t(w) + size_t(x)) * 3;
+                    const double l = 0.2126 * px[o] + 0.7152 * px[o + 1] + 0.0722 * px[o + 2];
+                    lum += l; if (l < 12.0) far++; cnt++;
+                }
+            for (int y = b * bh; y < (b + 1) * bh && y < h; ++y)
+                for (int x = xin; x < xin + n; ++x) {
+                    const size_t o = (size_t(y) * size_t(w) + size_t(x)) * 3;
+                    const double l = 0.2126 * px[o] + 0.7152 * px[o + 1] + 0.0722 * px[o + 2];
+                    lum_in += l; if (l < 12.0) far_in++; cnt_in++;
+                }
+            std::printf("[%.0f/%.0f%%|in %.0f/%.0f%%] ", lum / (double)cnt, 100.0 * far / (double)cnt,
+                lum_in / (double)cnt_in, 100.0 * far_in / (double)cnt_in);
+        }
+        std::printf("\n");
+    }
+    stbi_image_free(px);
+}
+
+// Column discontinuity scan: for each column, the share of rows where the
+// luma jumps hard from the previous column. Real scenery is smooth; garbage
+// columns (stride/upscale artifacts) light up near 100%.
+void column_scan(const std::string& path) {
+    int w = 0, h = 0, ch = 0;
+    unsigned char* px = stbi_load(path.c_str(), &w, &h, &ch, 3);
+    if (!px) {
+        std::printf("%s: load failed (%s)\n", path.c_str(), stbi_failure_reason());
+        return;
+    }
+    auto lum = [&](int x, int y) {
+        const size_t o = (size_t(y) * size_t(w) + size_t(x)) * 3;
+        return 0.2126 * px[o] + 0.7152 * px[o + 1] + 0.0722 * px[o + 2];
+    };
+    const int x0 = w - 160;
+    std::printf("column discontinuity (last 160 cols), %s:\n  ", path.c_str());
+    for (int x = x0; x < w; ++x) {
+        long jump = 0;
+        for (int y = 0; y < h; y += 3)
+            if (std::fabs(lum(x, y) - lum(x - 1, y)) > 60.0)
+                jump++;
+        std::printf("%d ", int(100.0 * double(jump) / double(h / 3)));
+    }
+    std::printf("\n");
+    stbi_image_free(px);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -138,6 +204,7 @@ int main(int argc, char** argv) {
     std::string save;
     std::string fit;
     double center = 0.0;
+    int edge = 0;
     std::vector<std::string> files;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -155,6 +222,8 @@ int main(int argc, char** argv) {
             save = argv[++i];
         else if (a == "--fit" && i + 1 < argc)
             fit = argv[++i];
+        else if (a == "--edge" && i + 1 < argc)
+            edge = std::atoi(argv[++i]);
         else
             files.push_back(a);
     }
@@ -163,6 +232,13 @@ int main(int argc, char** argv) {
                     "[--center frac] [--save out.png] [--fit ref.png]\n");
         return 2;
     }
+
+    if (edge > 0)
+        for (const auto& f : files)
+            edge_report(f, edge);
+    if (edge < 0)
+        for (const auto& f : files)
+            column_scan(f);
 
     for (const auto& f : files) {
         int w = 0, h = 0, ch = 0;
