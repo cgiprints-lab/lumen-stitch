@@ -1,8 +1,8 @@
 // Lumen Photo Mode - Dusklight integration (Ansel-style photography for Dusklight).
 //
 // M3 scope: everything from M2 (photo sessions with a free camera via a
-// CameraService operator, time freeze via a HookService post-hook on
-// dusk::game_clock::advance, HUD-free native-resolution capture via GfxService
+// CameraService operator, world freeze via the game's own global actor-pause
+// byte, HUD-free native-resolution capture via GfxService
 // resolve_pass at FRAME_BEFORE_HUD + WebGPU compute readback, hotkeys, capture
 // folder persistence, and gigapixel capture: an S x S grid of sub-frustum
 // re-projections sharing one eye - Ansel's gigapixel model - each tile written
@@ -92,8 +92,16 @@ IMPORT_SERVICE(FileService, svc_file);
 IMPORT_SERVICE(HookService, svc_hook);
 
 // Hook targets, resolved from the game symbol manifest at load. Absence degrades
-// gracefully: no freeze / no auto-exit rather than a dead mod.
-DEFINE_HOOK_SYMBOL("dusk::game_clock::advance", void*(), GameClockAdvance);
+// gracefully: no auto-exit rather than a dead mod.
+//
+// RETIRED (2026-11-26): a dusk::game_clock::advance() post-hook used to zero
+// FrameTiming's numSimTicks/dt as the photo-mode freeze. It was inert on the
+// default presentation path (that path ignores the tick count) and writing
+// dt=0 into the shared clock wedged the game's execute loop - after that no
+// further mod_update ran, so hotkeys and capture died while the pause byte
+// kept the world standing still. The freeze is now purely the game's own
+// global actor pause (see world_freeze_begin), exactly what the `freeze`
+// console command sets.
 DEFINE_HOOK_SYMBOL("dStage_changeScene", int(int, float, unsigned, signed char, short, int),
     StageChangeScene);
 // Moya cloud-shadow haze draw entry (d_kankyo_rain.h: drawCloudShadow(Mtx, u8**)).
@@ -102,15 +110,6 @@ DEFINE_HOOK_SYMBOL("dStage_changeScene", int(int, float, unsigned, signed char, 
 DEFINE_HOOK_SYMBOL("drawCloudShadow", void(float*, unsigned char**), CloudShadow);
 
 namespace {
-
-// Layout mirror of dusk::game_clock::FrameTiming (src/dusk/game_clock.h).
-struct FrameTimingMirror {
-    float dt;
-    bool interpolating;
-    bool separatePresentation;
-    int numSimTicks;
-    uint64_t presentationEpoch;
-};
 
 constexpr float kDegToRad = 3.14159265358979323846f / 180.0f;
 
@@ -287,7 +286,6 @@ GfxStageHookHandle g_hook_frame = 0;
 // itself stays off with an explanation rather than half-working. The exact
 // set is logged once so support reports can see what a build actually got.
 bool g_feat_capture = false; // stage hooks + compute type -> 1x + jobs
-bool g_feat_freeze = false;  // dusk::game_clock::advance hook
 bool g_feat_world_freeze = false; // game's own global actor-pause byte
 bool g_feat_autoexit = false; // dStage_changeScene hook
 bool g_feat_strip = false;   // haze hook or >=1 data pin resolved
@@ -420,6 +418,8 @@ void strip_end() {
 // Photo-mode world freeze: set the game's global actor-pause byte, which is
 // what the game's own "freeze" console command does. Entered on photo-mode
 // entry, released on exit (and on unload), with the previous value restored.
+std::chrono::steady_clock::time_point g_photo_remind_at{};
+
 void world_freeze_begin() {
     if (!g_world_pin.addr || g_world_pin.pinned || !cfg_bool(g_var_freeze_world, true))
         return;
@@ -432,8 +432,11 @@ void world_freeze_begin() {
 void world_freeze_end() {
     if (!g_world_pin.pinned)
         return;
-    std::memcpy(static_cast<unsigned char*>(g_world_pin.addr) + g_world_pin.offset,
-        g_world_pin.saved, g_world_pin.size);
+    unsigned char* p = static_cast<unsigned char*>(g_world_pin.addr) + g_world_pin.offset;
+    // Only undo our own pause: if the game itself changed the byte while we
+    // held it (its own freeze/menu toggles), leave its value alone.
+    if (*p == 1)
+        *p = g_world_pin.saved[0];
     g_world_pin.pinned = false;
 }
 
@@ -1138,32 +1141,28 @@ void enter_photo_mode() {
         mods::log::warn("lumen: camera operator registration failed");
     }
 
-    // Time freeze: the advance() post-hook zeroes numSimTicks and dt while
-    // frozen; the world freeze additionally sets the game's own global
-    // actor-pause byte. Only engage what actually resolved at load.
-    g_photo.frozen = g_feat_freeze;
+    // The freeze is the game's own global actor pause (the `freeze` console
+    // command's byte). No clock surgery: zeroing the shared FrameTiming wedged
+    // the game loop on 2026-11-25's builds.
+    g_photo.frozen = g_feat_world_freeze;
     world_freeze_begin();
+    g_photo_remind_at = std::chrono::steady_clock::now();
 
     char body[256];
     if (g_world_pin.pinned)
         std::snprintf(body, sizeof(body),
             "Photo mode on - the world is frozen. F7 capture, F12 gigapixel, "
             "Shift+F12 360, Shift+F7 stereo. Press F1 to return to the game.");
-    else if (g_photo.frozen)
-        std::snprintf(body, sizeof(body),
-            "Photo mode on - time stopped (actor freeze unavailable). "
-            "Press F1 to return to the game.");
     else
         std::snprintf(body, sizeof(body),
-            "Photo mode on (freeze unavailable in this build). Press F1 to return to the game.");
+            "Photo mode on (world freeze unavailable in this build). Press F1 to return to the game.");
     push_photo_toast("Lumen Photo Mode", body, "info", 12000);
     if (!cfg_bool(g_var_seen_controls, false)) {
         if (g_var_seen_controls)
             svc_config->set_bool(mod_ctx, g_var_seen_controls, true);
         push_controls_dialog();
     }
-    mods::log::info("lumen: photo mode on (clock freeze={}, world freeze={})", g_photo.frozen,
-        g_world_pin.pinned);
+    mods::log::info("lumen: photo mode on (world freeze={})", g_world_pin.pinned);
 }
 
 void exit_photo_mode() {
@@ -1616,27 +1615,6 @@ HookAction on_stage_change_pre(ModContext*, void*, void*, void*) {
     return HOOK_CONTINUE;
 }
 
-// dusk::game_clock::advance() returns const FrameTiming& - a pointer in the x64
-// ABI - and the SDK trampoline declares its return slot with the type we
-// declared (void*), so retval here points at that slot, not at the struct. The
-// first version of this hook cast retval directly, which wrote past an 8-byte
-// stack slot: the freeze silently did nothing (and writing at offset 0 would
-// have corrupted the returned pointer itself).
-void on_advance_post(ModContext*, void*, void* retval, void*) {
-    if (!g_photo.active || !g_photo.frozen || !retval)
-        return;
-    auto** slot = static_cast<void**>(retval);
-    auto* timing = static_cast<FrameTimingMirror*>(*slot);
-    if (!timing || reinterpret_cast<uintptr_t>(timing) < 0x10000)
-        return;
-    timing->numSimTicks = 0;
-    // Also stop the clock itself: dt drives interpolation, particle/texture
-    // animation and UI motion, all of which keep running on a tick-only freeze.
-    // Lumen's own flight input uses a steady clock (mod_update), so flying the
-    // free camera is unaffected.
-    timing->dt = 0.0f;
-}
-
 // ---------------------------------------------------------------- ui panel
 
 void on_toggle_pressed(ModContext*, void*) {
@@ -1945,9 +1923,6 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (!g_feat_capture)
         mods::log::warn("lumen: capture path unavailable - degraded, photo mode stays off");
 
-    g_feat_freeze = mods::hook::add_post<GameClockAdvance>(on_advance_post) == MOD_OK;
-    if (!g_feat_freeze)
-        mods::log::warn("lumen: game clock hook unavailable; time freeze disabled");
     g_feat_autoexit = mods::hook::add_pre<StageChangeScene>(on_stage_change_pre) == MOD_OK;
     if (!g_feat_autoexit)
         mods::log::warn("lumen: stage change hook unavailable; auto-exit disabled");
@@ -1975,11 +1950,9 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     // minor floor the loader will accept, and the host is only interesting
     // for support chatter. The feature line below says what matters.
     mods::log::info(
-        "lumen: features: capture {}, clock freeze {}, world freeze {}, auto-exit {}, "
-        "consistency {}",
-        g_feat_capture ? "yes" : "NO", g_feat_freeze ? "yes" : "no",
-        g_feat_world_freeze ? "yes" : "no", g_feat_autoexit ? "yes" : "no",
-        g_feat_strip ? "yes" : "no");
+        "lumen: features: capture {}, world freeze {}, auto-exit {}, consistency {}",
+        g_feat_capture ? "yes" : "NO", g_feat_world_freeze ? "yes" : "no",
+        g_feat_autoexit ? "yes" : "no", g_feat_strip ? "yes" : "no");
     mods::log::info("Lumen Photo Mode {} loaded (M6: photo + world freeze + gigapixel + 360 + "
                     "stereo + in-mod auto-stitch)",
         "0.1.0");
@@ -2033,6 +2006,23 @@ MOD_EXPORT ModResult mod_update(ModError* error) {
                 mods::log::warn("lumen: auto-stitch failed: {}", done);
             }
         }
+    }
+
+    // In-mode cheat sheet: restate the exit route while photo mode idles. The
+    // world stands still and nothing else on screen says which key gives the
+    // game back, so the reminder repeats. The heartbeat line is diagnostic:
+    // if it stops mid-session, the game stopped calling mod_update.
+    if (g_photo.active && !g_job.active && !g_stitch_running) {
+        static uint32_t s_beat = 0;
+        if (std::chrono::steady_clock::now() >= g_photo_remind_at) {
+            g_photo_remind_at = std::chrono::steady_clock::now() + std::chrono::seconds(12);
+            push_photo_toast("Lumen Photo Mode",
+                "Photo mode - press F1 to return to the game. F7 capture, F12 gigapixel, "
+                "Shift+F12 360, Shift+F7 stereo; WASD + arrows fly the camera.",
+                "info", 5000);
+        }
+        if (++s_beat % 900 == 0)
+            mods::log::info("lumen: photo mode alive ({} updates)", s_beat);
     }
 
     // Stall watchdog: a capture whose map never completes (lost device,
