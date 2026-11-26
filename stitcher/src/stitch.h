@@ -33,16 +33,26 @@ struct Job {
 
 bool load_job(const std::filesystem::path& manifest, Job& job, std::string& err);
 
-// Receives composite output: `rows` master rows starting at y0, RGB packed,
-// row stride = master.width * 3.
+// Receives composite output: `rows` raster rows starting at y0, RGB packed,
+// row stride = raster.width * 3 (master.width for composite, the reduced
+// width for composite_scaled).
 using StripFn = std::function<bool(uint64_t y0, uint64_t rows, const uint8_t* rgb)>;
 
 // Composite the full master grid through `strip`.
 bool composite(const Job& job, const StripFn& strip,
     const std::function<void(uint32_t percent)>& progress, std::string& err);
 
+// Composite a reduced raster: output pixel (x, y) is the box average of the
+// master pixels covered by [x*N, (x+1)*N) x [y*N, (y+1)*N), sampled through
+// the same per-tile homographies as composite. This is a true downsample of
+// the master grid (never a crop or point resample of the stitched image);
+// cost stays proportional to master pixels. Output dims ceil(master / N).
+bool composite_scaled(const Job& job, uint32_t factor, const StripFn& strip,
+    const std::function<void(uint32_t percent)>& progress, std::string& err);
+
 struct Options {
     std::filesystem::path out;              // primary .tiff
+    uint32_t downscale = 1;                 // N>1: primary = master / N box downsample
     bool preview_jpeg = true;               // reduced-level JPEG preview
     bool preview_png = false;               // reduced-level PNG preview
     uint32_t preview_max = 4096;            // longest edge for previews

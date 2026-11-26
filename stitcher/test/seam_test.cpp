@@ -8,6 +8,8 @@
 //     extra scrutiny on pixels flanking tile seams. Uses a FOV=90 master.
 //  3. BigTIFF structure: magic/version/IFD chain/tile tables/SubIFD mip
 //     chain, and a decodable JPEG preview.
+//  4. downsample path: composite_scaled box-average matches the exact master
+//     grid downsample; run() level-0 dims are ceil(master / N).
 //
 // Exits non-zero on the first failure.
 #include "stitch.h"
@@ -18,6 +20,7 @@
 #include "stb_image.h"
 #include "stb_image_write.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -338,6 +341,105 @@ void test_stitch(const std::filesystem::path& tmp) {
         stbi_image_free(pimg);
 }
 
+// ---------------------------------------------------------------- test 4
+
+// Downsample path: composite_scaled(N) must equal the exact box downsample of
+// the master grid (not a resample of the stitched raster), and run() must
+// honour ceil(master / N) level-0 dimensions.
+void test_downscale(const std::filesystem::path& tmp) {
+    std::printf("downsample path (master/2 box downsample vs exact reference):\n");
+    lumen::tilemath::Master m;
+    m.yaw = 0.35;
+    m.pitch = -0.1;
+    m.fovy = 90;
+    m.vw = 64;
+    m.vh = 48;
+    m.width = 128;
+    m.height = 96;
+
+    lumen::stitch::Job job;
+    std::string err;
+    if (!lumen::stitch::load_job(tmp / "job.json", job, err)) {
+        check(false, "load_job: " + err);
+        return;
+    }
+
+    const uint32_t f = 2, OW = 64, OH = 48;
+    std::vector<uint8_t> raster(static_cast<size_t>(OW) * OH * 3);
+    uint64_t rows = 0;
+    bool size_ok = true;
+    const bool ok = lumen::stitch::composite_scaled(job, f,
+        [&](uint64_t y0, uint64_t n, const uint8_t* rgb) {
+            for (uint64_t r = 0; r < n; ++r) {
+                if (y0 + r >= OH)
+                    size_ok = false;
+                else
+                    std::copy(rgb + r * OW * 3, rgb + (r + 1) * OW * 3,
+                        raster.data() + (y0 + r) * OW * 3);
+                ++rows;
+            }
+            return true;
+        },
+        {}, err);
+    check(ok && size_ok && rows == OH, "composite_scaled(2): 48 rows, 64 px stride, no error");
+    if (!ok)
+        return;
+
+    // Exact expectation: box average of the scene at the master pixel centres
+    // the output pixel covers. Bilinear tile sampling carries the same
+    // <= 3/255 slop already quantified by the 1:1 seam test.
+    int worst = 0;
+    for (uint32_t y = 0; y < OH; ++y) {
+        for (uint32_t x = 0; x < OW; ++x) {
+            uint32_t acc[3] = {0, 0, 0};
+            for (uint32_t j = 0; j < f; ++j) {
+                for (uint32_t i = 0; i < f; ++i) {
+                    uint8_t ref[3];
+                    master_ref(m, x * f + i, y * f + j, ref);
+                    for (int c = 0; c < 3; ++c)
+                        acc[c] += ref[c];
+                }
+            }
+            for (int c = 0; c < 3; ++c) {
+                const int want = static_cast<int>((acc[c] + 2) / 4);
+                const int got = raster[(static_cast<size_t>(y) * OW + x) * 3 + c];
+                worst = std::max(worst, std::abs(got - want));
+            }
+        }
+    }
+    check(worst <= 3, "box downsample matches exact reference within 3/255 (worst " +
+            std::to_string(worst) + ")");
+
+    // run() with --downscale: level-0 dims are ceil(master / N).
+    lumen::stitch::Options opt;
+    opt.out = tmp / "ds.tiff";
+    opt.downscale = 3;  // ceil(128/3)=43, ceil(96/3)=32
+    opt.preview_max = 64;
+    opt.min_mip_edge = 16;
+    if (!lumen::stitch::run(tmp / "job.json", opt, err)) {
+        check(false, "stitch::run(downscale=3): " + err);
+        return;
+    }
+    std::FILE* fd = std::fopen(opt.out.string().c_str(), "rb");
+    if (!fd) {
+        check(false, "cannot reopen downscaled output");
+        return;
+    }
+    rd(fd, 2);
+    rd(fd, 2);
+    rd(fd, 2);
+    rd(fd, 2);  // magic + version + offset-size half
+    std::vector<IfdEntry> ifd0;
+    uint64_t next = 0;
+    if (read_ifd(fd, rd(fd, 8), ifd0, next)) {
+        const auto* w = find_entry(ifd0, 256);
+        const auto* h = find_entry(ifd0, 257);
+        check(w && w->value == 43 && h && h->value == 32, "run(downscale=3) level 0 is 43x32");
+    } else
+        check(false, "downscaled IFD0 parses");
+    std::fclose(fd);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -348,6 +450,7 @@ int main(int argc, char** argv) {
 
     test_round_trip();
     test_stitch(tmp);
+    test_downscale(tmp);
 
     if (g_failures) {
         std::printf("%d failure(s)\n", g_failures);

@@ -3,8 +3,8 @@
 //   lumen status
 //   lumen install --adapter <id> [--artifact <path> | --build] [--all]
 //   lumen uninstall --adapter <id> [--all]
-//   lumen stitch <manifest.json> [--out <file.tiff>] [--preview-max N]
-//                [--min-mip N] [--preview-png] [--no-preview]
+//   lumen stitch <manifest.json> [--out <file.tiff>] [--downscale N]
+//                [--preview-max N] [--min-mip N] [--preview-png] [--no-preview]
 #include "adapter.h"
 #include "detect.h"
 #include "state.h"
@@ -210,6 +210,8 @@ int cmd_stitch(int argc, char** argv) {
             opt.preview_max = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
         else if (a == "--min-mip" && i + 1 < argc)
             opt.min_mip_edge = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+        else if (a == "--downscale" && i + 1 < argc)
+            opt.downscale = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
         else if (a == "--no-preview")
             opt.preview_jpeg = opt.preview_png = false;
         else if (a == "--preview-png")
@@ -219,7 +221,8 @@ int cmd_stitch(int argc, char** argv) {
     }
     if (manifest.empty()) {
         std::cerr << "usage: lumen stitch <manifest.json> [--out <file.tiff>] "
-                     "[--preview-max N] [--min-mip N] [--preview-png] [--no-preview]\n";
+                     "[--downscale N] [--preview-max N] [--min-mip N] [--preview-png] "
+                     "[--no-preview]\n";
         return 1;
     }
     uint32_t last_pct = 0;

@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <sstream>
 
@@ -243,21 +244,24 @@ bool load_job(const std::filesystem::path& manifest, Job& job, std::string& err)
     return true;
 }
 
-bool composite(const Job& job, const StripFn& strip,
-    const std::function<void(uint32_t percent)>& progress, std::string& err) {
+namespace {
+
+// Validate master/tile sizes and lay the job tiles into a tilesX x tilesY
+// grid of pointers (nulls where a tile is missing).
+bool build_grid(const Job& job, std::vector<const JobTile*>& grid, uint32_t& tilesX,
+    uint32_t& tilesY, std::string& err) {
     const uint32_t vw = job.master.vw, vh = job.master.vh;
     const uint32_t W = job.master.width, H = job.master.height;
     if (!vw || !vh || !W || !H) {
         err = "zero-size master";
         return false;
     }
-    const uint32_t tilesX = W / vw, tilesY = H / vh;
+    tilesX = W / vw, tilesY = H / vh;
     if (tilesX * vw != W || tilesY * vh != H) {
         err = "master size is not an integer multiple of the tile size";
         return false;
     }
-
-    std::vector<const JobTile*> grid(static_cast<size_t>(tilesX) * tilesY, nullptr);
+    grid.assign(static_cast<size_t>(tilesX) * tilesY, nullptr);
     for (const auto& t : job.tiles) {
         if (t.row < 0 || t.row >= static_cast<int>(tilesY) || t.col < 0 ||
             t.col >= static_cast<int>(tilesX)) {
@@ -272,6 +276,19 @@ bool composite(const Job& job, const StripFn& strip,
             return false;
         }
     }
+    return true;
+}
+
+}  // namespace
+
+bool composite(const Job& job, const StripFn& strip,
+    const std::function<void(uint32_t percent)>& progress, std::string& err) {
+    const uint32_t vw = job.master.vw, vh = job.master.vh;
+    const uint32_t W = job.master.width, H = job.master.height;
+    std::vector<const JobTile*> grid;
+    uint32_t tilesX = 0, tilesY = 0;
+    if (!build_grid(job, grid, tilesX, tilesY, err))
+        return false;
 
     std::vector<uint8_t> out_row(static_cast<size_t>(W) * 3);
     for (uint32_t ty = 0; ty < tilesY; ++ty) {
@@ -328,17 +345,125 @@ bool composite(const Job& job, const StripFn& strip,
     return true;
 }
 
+bool composite_scaled(const Job& job, uint32_t factor, const StripFn& strip,
+    const std::function<void(uint32_t percent)>& progress, std::string& err) {
+    if (factor == 0)
+        factor = 1;
+    const uint32_t vw = job.master.vw, vh = job.master.vh;
+    const uint32_t W = job.master.width, H = job.master.height;
+    std::vector<const JobTile*> grid;
+    uint32_t tilesX = 0, tilesY = 0;
+    if (!build_grid(job, grid, tilesX, tilesY, err))
+        return false;
+    const uint64_t OW = (W + factor - 1ull) / factor, OH = (H + factor - 1ull) / factor;
+
+    // Output rows advance monotonically, so tile bands (grid rows) are
+    // decoded on demand into a sliding window and evicted behind us. An
+    // output row spanning several bands keeps them all live - unavoidable,
+    // its samples genuinely come from each.
+    struct Band {
+        std::vector<std::vector<uint8_t>> imgs;
+        std::vector<uint32_t> iw, ih;
+        std::vector<tilemath::RayMap> maps;
+    };
+    std::deque<Band> cache;
+    uint32_t cache_first = 0;
+    const auto decode_band = [&](uint32_t ty) -> bool {
+        Band b;
+        b.imgs.resize(tilesX);
+        b.iw.resize(tilesX, 0);
+        b.ih.resize(tilesX, 0);
+        b.maps.resize(tilesX);
+        for (uint32_t tx = 0; tx < tilesX; ++tx) {
+            const JobTile& t = *grid[static_cast<size_t>(ty) * tilesX + tx];
+            const auto path = job.base_dir / t.file;
+            int tw = 0, th = 0, ch = 0;
+            unsigned char* px = stbi_load(path.string().c_str(), &tw, &th, &ch, 4);
+            if (!px) {
+                err = "cannot decode tile " + path.string();
+                return false;
+            }
+            b.iw[tx] = static_cast<uint32_t>(tw);
+            b.ih[tx] = static_cast<uint32_t>(th);
+            b.imgs[tx].assign(px, px + static_cast<size_t>(tw) * static_cast<size_t>(th) * 4);
+            stbi_image_free(px);
+            tilemath::Tile tm;
+            tm.yaw = t.yaw;
+            tm.pitch = t.pitch;
+            tm.fovy = t.fovy;
+            tm.w = t.w;
+            tm.h = t.h;
+            b.maps[tx] = tilemath::RayMap(job.master, tm);
+        }
+        cache.push_back(std::move(b));
+        return true;
+    };
+
+    std::vector<uint8_t> out_row(static_cast<size_t>(OW) * 3);
+    for (uint64_t y = 0; y < OH; ++y) {
+        const uint64_t my0 = y * factor;
+        const uint64_t my1 = std::min((y + 1) * factor, static_cast<uint64_t>(H)) - 1;
+        const uint32_t b0 = static_cast<uint32_t>(my0 / vh);
+        const uint32_t b1 = static_cast<uint32_t>(my1 / vh);
+        while (cache_first < b0) {
+            cache.pop_front();
+            ++cache_first;
+        }
+        while (cache_first + cache.size() <= b1) {
+            if (!decode_band(static_cast<uint32_t>(cache_first + cache.size())))
+                return false;
+        }
+        for (uint64_t x = 0; x < OW; ++x) {
+            const uint64_t mx0 = x * factor;
+            const uint64_t mx1 = std::min((x + 1) * factor, static_cast<uint64_t>(W)) - 1;
+            uint64_t acc[3] = {0, 0, 0};
+            uint32_t n = 0;
+            for (uint64_t my = my0; my <= my1; ++my) {
+                Band& band = cache[static_cast<size_t>((my / vh) - cache_first)];
+                for (uint64_t mx = mx0; mx <= mx1; ++mx) {
+                    const uint32_t tx =
+                        static_cast<uint32_t>(std::min(mx / vw, static_cast<uint64_t>(tilesX - 1)));
+                    double px, py;
+                    if (!band.maps[tx].eval(static_cast<double>(mx), static_cast<double>(my), px,
+                            py))
+                        continue;  // outside this tile's footprint (master border only)
+                    uint8_t s[3];
+                    sample_tile(band.imgs[tx].data(), band.iw[tx], band.ih[tx], px, py, s);
+                    acc[0] += s[0];
+                    acc[1] += s[1];
+                    acc[2] += s[2];
+                    ++n;
+                }
+            }
+            uint8_t* dst = out_row.data() + static_cast<size_t>(x) * 3;
+            if (n) {
+                for (int c = 0; c < 3; ++c)
+                    dst[c] = static_cast<uint8_t>((acc[c] + n / 2) / n);
+            } else
+                dst[0] = dst[1] = dst[2] = 0;
+        }
+        if (!strip(y, 1, out_row.data())) {
+            err = "strip consumer failed";
+            return false;
+        }
+        if (progress)
+            progress(static_cast<uint32_t>(100ull * (y + 1) / OH));
+    }
+    return true;
+}
+
 bool run(const std::filesystem::path& manifest, const Options& opt, std::string& err,
     const std::function<void(uint32_t percent)>& progress) {
     Job job;
     if (!load_job(manifest, job, err))
         return false;
 
+    const uint32_t dscale = opt.downscale ? opt.downscale : 1;
     std::vector<BigTiffWriter::Level> levels;
     {
         BigTiffWriter::Level l0;
-        l0.width = job.master.width;
-        l0.height = job.master.height;
+        l0.width = (job.master.width + dscale - 1) / dscale;
+        l0.height = (job.master.height + dscale - 1) / dscale;
         l0.tileW = l0.tileH = 256;
         levels.push_back(l0);
         while (std::max(levels.back().width, levels.back().height) > opt.min_mip_edge) {
@@ -374,13 +499,13 @@ bool run(const std::filesystem::path& manifest, const Options& opt, std::string&
         feeder.sinks.push_back(&s);
     feeder.prev_src.resize(levels.size());
 
-    const bool ok = composite(job,
-        [&](uint64_t y, uint64_t rows, const uint8_t* rgb) {
-            for (uint64_t r = 0; r < rows; ++r)
-                feeder.feed(0, y + r, rgb + static_cast<size_t>(r) * levels[0].width * 3);
-            return true;
-        },
-        progress, err);
+    const auto sink_rows = [&](uint64_t y, uint64_t rows, const uint8_t* rgb) {
+        for (uint64_t r = 0; r < rows; ++r)
+            feeder.feed(0, y + r, rgb + static_cast<size_t>(r) * levels[0].width * 3);
+        return true;
+    };
+    const bool ok = dscale == 1 ? composite(job, sink_rows, progress, err)
+                                : composite_scaled(job, dscale, sink_rows, progress, err);
     feeder.finish();
     if (!tiff.close(err))
         return false;

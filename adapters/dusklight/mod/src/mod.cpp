@@ -158,6 +158,7 @@ struct JobState {
     bool build_pending = false; // waiting on the viewport-size probe
     uint32_t S = 0;             // tiles per side, frozen at job start
     uint32_t vw = 0, vh = 0;    // scene color size (probe)
+    WGPUTextureFormat color_format = WGPUTextureFormat_Undefined; // probe (see manifest)
     uint64_t id = 0;            // timestamp shared by tile names + manifest
     std::vector<JobTileDef> tiles;
     size_t idx = 0;
@@ -516,6 +517,14 @@ void build_job_tiles(uint32_t vw, uint32_t vh) {
     m.height = vh * S;
     g_job.vw = vw;
     g_job.vh = vh;
+    // The readback shader quantizes normalized samples to 8-bit. Dusklight's
+    // scene target is fixed RGBA8Unorm (aurora g_efbFormat), so that loses
+    // nothing here; record the probed format so the stitcher and future HDR
+    // adapters can tell, and flag float formats as a known gap.
+    if (g_job.color_format != WGPUTextureFormat_RGBA8Unorm)
+        mods::log::warn("lumen: scene color format {} - capture quantizes to LDR 8-bit; "
+                        "HDR readback not wired for this adapter",
+            static_cast<unsigned>(g_job.color_format));
     char name[160];
     for (uint32_t r = 0; r < S; ++r) {
         for (uint32_t c = 0; c < S; ++c) {
@@ -540,10 +549,11 @@ void build_job_tiles(uint32_t vw, uint32_t vh) {
     }
     char head[320];
     std::snprintf(head, sizeof(head),
-        "{\"lumenJob\":1,\"scale\":%" PRIu32 ",\"master\":{\"yaw\":%.9g,\"pitch\":%.9g,"
-        "\"fovy\":%.9g,\"vw\":%" PRIu32 ",\"vh\":%" PRIu32 ",\"width\":%" PRIu32
+        "{\"lumenJob\":1,\"scale\":%" PRIu32 ",\"colorFormat\":%u,\"master\":{\"yaw\":%.9g,"
+        "\"pitch\":%.9g,\"fovy\":%.9g,\"vw\":%" PRIu32 ",\"vh\":%" PRIu32 ",\"width\":%" PRIu32
         ",\"height\":%" PRIu32 "},\"tiles\":[",
-        S, m.yaw, m.pitch, m.fovy, vw, vh, m.width, m.height);
+        S, static_cast<unsigned>(g_job.color_format), m.yaw, m.pitch, m.fovy, vw, vh, m.width,
+        m.height);
     g_job.json = head;
     g_job.build_pending = false;
 }
@@ -993,6 +1003,7 @@ void on_frame_before_hud(ModContext*, const GfxStageContext*, void*) {
         if (svc_gfx->resolve_pass(mod_ctx, &resolveDesc, &targets) == MOD_OK && targets.width &&
             targets.height) {
             // Views from resolve_pass are borrowed for this callback only.
+            g_job.color_format = targets.color_format;
             build_job_tiles(targets.width, targets.height);
         }
         return;
