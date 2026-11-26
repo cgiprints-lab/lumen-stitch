@@ -140,6 +140,7 @@ struct CaptureState {
     uint32_t uniform_offset = 0;   // dims slot inside the frame uniform stream
     // Persistent pipeline.
     WGPUComputePipeline pipeline = nullptr;
+    uint32_t buf_bytes = 0;        // size of the live staging/storage pair (0 = none)
     bool map_failed = false;       // set by the map callback on non-Success status
 };
 CaptureState g_capture;
@@ -219,8 +220,10 @@ DataPin g_pins[] = {
     {"?mBlureFlag@mDoGph_gInf_c@@2EA", "mDoGph_gInf_c::mBlureFlag", 0, 1, 0, nullptr, {}, false},
     {"?mFade@mDoGph_gInf_c@@2EA", "mDoGph_gInf_c::mFade", 0, 1, 0, nullptr, {}, false},
     // bloom_c is nested inside mDoGph_gInf_c, and m_bloom is an object, not a
-    // pointer: the type encodes as Vbloom_c@mDoGph_gInf_c@@.
-    {"?m_bloom@mDoGph_gInf_c@@2Vbloom_c@mDoGph_gInf_c@@A", "mDoGph_gInf_c::m_bloom", 0x08, 1, 0,
+    // pointer. MSVC compresses the nested *type* reference with a back-token:
+    // the shipped manifest key is ?m_bloom@mDoGph_gInf_c@@2Vbloom_c@1@A
+    // (extracted verbatim from the embedded manifest in dusklight.exe).
+    {"?m_bloom@mDoGph_gInf_c@@2Vbloom_c@1@A", "mDoGph_gInf_c::m_bloom", 0x08, 1, 0,
         nullptr, {}, false},
 };
 
@@ -447,6 +450,31 @@ void reset_capture_buffers() {
         wgpuBufferRelease(g_capture.storage);
         g_capture.storage = nullptr;
     }
+    g_capture.buf_bytes = 0;
+}
+
+// The staging/storage pair is reused across captures while the scene size
+// is unchanged. Creating and freeing a ~25 MB pair per tile exhausted the
+// driver's heap during a gigapixel run: the v2.0.3 acceptance log crashed
+// inside amdxc64.dll (D3D12 buffer op) at tile 25 with ~640 MB of churn.
+bool ensure_capture_buffers(WGPUDevice device, uint32_t bytes) {
+    if (g_capture.staging && g_capture.storage && g_capture.buf_bytes == bytes)
+        return true;
+    reset_capture_buffers();
+    WGPUBufferDescriptor bd = WGPU_BUFFER_DESCRIPTOR_INIT;
+    bd.label = {"lumen_staging", WGPU_STRLEN};
+    bd.usage = WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst;
+    bd.size = bytes;
+    g_capture.staging = wgpuDeviceCreateBuffer(device, &bd);
+    bd.label = {"lumen_storage", WGPU_STRLEN};
+    bd.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc;
+    g_capture.storage = wgpuDeviceCreateBuffer(device, &bd);
+    if (!g_capture.staging || !g_capture.storage) {
+        reset_capture_buffers();
+        return false;
+    }
+    g_capture.buf_bytes = bytes;
+    return true;
 }
 
 // ---------------------------------------------------------------- photo session
@@ -586,11 +614,13 @@ void start_stereo() {
     mods::log::info("lumen: stereo job {} started (3 views)", g_job.id);
 }
 
-// Dusklight's scene target is fixed RGBA8Unorm (aurora g_efbFormat), so the
-// 8-bit readback loses nothing; record the probed format so the stitcher and
-// future adapters can tell, and flag float formats as a known gap.
+// The probed v2.0.3 scene target is BGRA8Unorm (format 27) - aurora's swap-
+// chain format. Both 8-bit orders are handled losslessly by the readback
+// shader (it swaps components when the format is BGRA); float/HDR formats
+// would quantize, so they stay flagged as a known gap.
 void warn_if_not_rgba8() {
-    if (g_job.color_format != WGPUTextureFormat_RGBA8Unorm)
+    if (g_job.color_format != WGPUTextureFormat_RGBA8Unorm &&
+        g_job.color_format != WGPUTextureFormat_BGRA8Unorm)
         mods::log::warn("lumen: scene color format {} - capture quantizes to LDR 8-bit; "
                         "HDR readback not wired for this adapter",
             static_cast<unsigned>(g_job.color_format));
@@ -990,7 +1020,7 @@ void apply_flight_input(float) {}
 constexpr char kReadbackShader[] = R"wgsl(
 @group(0) @binding(0) var src : texture_2d<f32>;
 @group(0) @binding(1) var<storage, read_write> dst : array<u32>;
-struct P { w:u32, h:u32, sp0:u32, sp1:u32 };
+struct P { w:u32, h:u32, swap_rb:u32, sp0:u32 };
 @group(0) @binding(2) var<uniform> p : P;
 
 @compute @workgroup_size(8, 8)
@@ -1000,7 +1030,16 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     }
     let c = textureLoad(src, vec2<i32>(i32(gid.x), i32(gid.y)), 0);
     let q = vec4<u32>(vec4<i32>(clamp(c, vec4<f32>(0.0), vec4<f32>(1.0)) * vec4<f32>(255.0) + vec4<f32>(0.5)));
-    dst[gid.y * p.w + gid.x] = q.x | (q.y << 8u) | (q.z << 16u) | (q.w << 24u);
+    var r = q.x;
+    var b = q.z;
+    if (p.swap_rb != 0u) {
+        r = q.z;
+        b = q.x;
+    }
+    // Screenshot alpha is opaque regardless of what the scene buffer stored:
+    // the game leaves scene-color alpha at 0, and a zero-alpha PNG renders
+    // blank in every viewer (and premultiplies to black in GDI+/WIC).
+    dst[gid.y * p.w + gid.x] = r | (q.y << 8u) | (b << 16u) | 0xFF000000u;
 }
 )wgsl";
 
@@ -1095,30 +1134,34 @@ void issue_capture(WGPUDevice device) {
     const uint32_t w = targets.width;
     const uint32_t h = targets.height;
     const uint32_t bytes = w * h * 4u;
+    // Job tiles must share the geometry frozen at job start: if the scene
+    // size drifts mid-job (dynamic resolution scaling), stop rather than
+    // mix tile sizes in one manifest.
+    if (g_capture.for_job && g_job.active && g_job.vw != 0 &&
+        (w != g_job.vw || h != g_job.vh)) {
+        fail_capture("Capture failed: scene resolution changed mid-job.");
+        return;
+    }
     ensure_pipeline(device);
     if (!g_capture.pipeline) {
         fail_capture("Capture failed: compute pipeline unavailable.");
         return;
     }
 
-    reset_capture_buffers();
-    {
-        WGPUBufferDescriptor bd = WGPU_BUFFER_DESCRIPTOR_INIT;
-        bd.label = {"lumen_staging", WGPU_STRLEN};
-        bd.usage = WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst;
-        bd.size = bytes;
-        g_capture.staging = wgpuDeviceCreateBuffer(device, &bd);
-        bd.label = {"lumen_storage", WGPU_STRLEN};
-        bd.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc;
-        g_capture.storage = wgpuDeviceCreateBuffer(device, &bd);
-    }
-    if (!g_capture.staging || !g_capture.storage) {
+    if (!ensure_capture_buffers(device, bytes)) {
         fail_capture("Capture failed: buffer allocation failed.");
         return;
     }
     // Dims ride the frame's shared uniform stream; binding 2 resolves to that
-    // buffer's pushed slot inside the compute context.
-    const uint32_t dims[4] = {w, h, 0, 0};
+    // buffer's pushed slot inside the compute context. swap_rb: WGSL
+    // textureLoad on a BGRA format returns components in the format's order
+    // (x=B, z=R), so the byte packing must swap R and B to hand stbi true
+    // RGBA order.
+    const uint32_t swap_rb =
+        (targets.color_format == WGPUTextureFormat_BGRA8Unorm ||
+            targets.color_format == WGPUTextureFormat_BGRA8UnormSrgb)
+        ? 1u : 0u;
+    const uint32_t dims[4] = {w, h, swap_rb, 0};
     GfxRange uniformRange = {};
     if (svc_gfx->push_uniform(mod_ctx, dims, sizeof(dims), &uniformRange) != MOD_OK) {
         fail_capture("Capture failed: uniform stream rejected.");
@@ -1162,7 +1205,11 @@ void finish_capture_file() {
     std::vector<uint8_t> png;
     const int ok = stbi_write_png_to_func(png_write_cb, &png, static_cast<int>(g_capture.width),
         static_cast<int>(g_capture.height), 4, mapped, static_cast<int>(g_capture.width * 4));
-    reset_capture_buffers();
+    // Keep the buffer pair for the next capture (reuse pool); only the
+    // staging mapping must drop before the next MapAsync.
+    if (g_capture.staging &&
+        wgpuBufferGetMapState(g_capture.staging) == WGPUBufferMapState_Mapped)
+        wgpuBufferUnmap(g_capture.staging);
     g_capture.phase = CAPTURE_NONE;
     auto fail = [&](const char* why) {
         push_photo_toast("Lumen Photo Mode", why, "error");
