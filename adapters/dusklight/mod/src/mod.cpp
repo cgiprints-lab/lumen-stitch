@@ -176,6 +176,8 @@ struct JobState {
     bool active = false;
     bool build_pending = false; // waiting on the viewport-size probe
     int probe_frames = 0;       // probe watchdog (frames while build_pending)
+    uint32_t probe_w = 0, probe_h = 0; // last probe reading (must repeat once)
+    int rebuilds = 0;           // mid-job grid rebuilds (transient resizes)
     uint32_t S = 0;             // tiles per side, frozen at job start (GRID)
     uint32_t vw = 0, vh = 0;    // scene color size (probe)
     WGPUTextureFormat color_format = WGPUTextureFormat_Undefined; // probe (see manifest)
@@ -562,9 +564,12 @@ bool job_startable() {
 }
 
 // Shared kickoff: everything is decided after the viewport-size probe.
-void begin_job(JobState::Kind kind, uint32_t S) {    g_job.active = true;
+void begin_job(JobState::Kind kind, uint32_t S) {
+    g_job.active = true;
     g_job.build_pending = true; // need the scene color size before aiming tiles
     g_job.probe_frames = 0;
+    g_job.probe_w = g_job.probe_h = 0;
+    g_job.rebuilds = 0;
     g_job.kind = kind;
     g_job.S = S;
     g_job.tiles.clear();
@@ -1123,6 +1128,36 @@ void on_readback_compute(ModContext*, const GfxComputeContext* compute, const vo
 
 GfxComputeTypeHandle g_compute_type = 0;
 
+// The viewport changed while a job was mid-flight (the game's internal
+// resolution is "Auto" by default: the present/EFB size tracks the window,
+// and menu/HUD present-target switches can flicker it). Rather than lose the
+// job, re-freeze the grid at the new size: tiles restart from tile 0 under a
+// fresh id (old partial PNGs have no manifest, so the stitcher ignores them).
+// Bounded retries: a scene that resizes on every tile is unwinnable, and
+// then the honest answer is to fix the game's setting.
+bool rebuild_job_at_size(uint32_t w, uint32_t h) {
+    if (g_job.rebuilds >= 3)
+        return false;
+    ++g_job.rebuilds;
+    mods::log::warn("lumen: viewport changed mid-job {}x{} -> {}x{}; rebuilding grid (attempt {})",
+        g_job.vw, g_job.vh, w, h, g_job.rebuilds);
+    g_capture.phase = CAPTURE_NONE;
+    g_capture.for_job = false;
+    g_capture.name.clear();
+    g_job.tiles.clear();
+    g_job.idx = 0;
+    g_job.json.clear();
+    g_job.build_pending = true;
+    g_job.probe_frames = 0;
+    g_job.probe_w = w; // seed the probe: one confirming frame, then aim
+    g_job.probe_h = h;
+    g_job.id = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+    return true;
+}
+
 void issue_capture(WGPUDevice device) {
     GfxResolveDesc resolveDesc = GFX_RESOLVE_DESC_INIT;
     resolveDesc.color = true;
@@ -1139,7 +1174,10 @@ void issue_capture(WGPUDevice device) {
     // mix tile sizes in one manifest.
     if (g_capture.for_job && g_job.active && g_job.vw != 0 &&
         (w != g_job.vw || h != g_job.vh)) {
-        fail_capture("Capture failed: scene resolution changed mid-job.");
+        if (rebuild_job_at_size(w, h))
+            return;
+        fail_capture("Capture failed: scene resolution kept changing. Set the game's "
+                     "Internal Resolution to a fixed value (not Auto) and retry.");
         return;
     }
     ensure_pipeline(device);
@@ -1281,8 +1319,17 @@ void on_frame_before_hud(ModContext*, const GfxStageContext*, void*) {
         if (svc_gfx->resolve_pass(mod_ctx, &resolveDesc, &targets) == MOD_OK && targets.width &&
             targets.height) {
             // Views from resolve_pass are borrowed for this callback only.
-            g_job.color_format = targets.color_format;
-            build_job_tiles(targets.width, targets.height);
+            // Stability: the size must read the same on two consecutive
+            // probes. The present target can flicker during menu/HUD
+            // transitions, and freezing the grid on a transient size would
+            // mismatch every tile.
+            if (targets.width == g_job.probe_w && targets.height == g_job.probe_h) {
+                g_job.color_format = targets.color_format;
+                build_job_tiles(targets.width, targets.height);
+            } else {
+                g_job.probe_w = targets.width;
+                g_job.probe_h = targets.height;
+            }
         } else if (++g_job.probe_frames > 300) {
             abort_job(false);
             push_photo_toast("Lumen Photo Mode",
