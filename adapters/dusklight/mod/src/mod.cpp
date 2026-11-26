@@ -199,10 +199,11 @@ struct DataPin {
     bool pinned = false;
 };
 DataPin g_pins[] = {
-    // MSVC: bool -> _N, u8 -> E; bloom_c mangled as PEAVbloom_c@@.
-    {"?mBlureFlag@mDoGph_gInf_c@@3_NA", "mDoGph_gInf_c::mBlureFlag", 0, 1, 0, nullptr, {}, false},
-    {"?mFade@mDoGph_gInf_c@@3EA", "mDoGph_gInf_c::mFade", 0, 1, 0, nullptr, {}, false},
-    {"?m_bloom@mDoGph_gInf_c@@2PEAVbloom_c@@EA", "mDoGph_gInf_c::m_bloom", 0x08, 1, 0,
+    // MSVC static *class member* data: storage char '2'; bool -> _N, u8 -> E,
+    // class object -> PEAV<type>@@; decoration terminates in a single 'A'.
+    {"?mBlureFlag@mDoGph_gInf_c@@2_NA", "mDoGph_gInf_c::mBlureFlag", 0, 1, 0, nullptr, {}, false},
+    {"?mFade@mDoGph_gInf_c@@2EA", "mDoGph_gInf_c::mFade", 0, 1, 0, nullptr, {}, false},
+    {"?m_bloom@mDoGph_gInf_c@@2PEAVbloom_c@@A", "mDoGph_gInf_c::m_bloom", 0x08, 1, 0,
         nullptr, {}, false},
 };
 
