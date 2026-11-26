@@ -45,14 +45,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Explicit cross product: include entries paired with a matrix list
+        # do NOT multiply (run 4578587160 proved GitHub folds them 1:1),
+        # so enumerate all 9 platform x version combos.
         include:
-          - os: windows-latest
-            platform: windows-x64
-          - os: ubuntu-latest
-            platform: linux-x64
-          - os: macos-latest
-            platform: macos-arm64
-        dusklight: [v2.0.1, v2.0.2, v2.0.3]
+          - { os: windows-latest, platform: windows-x64, dusklight: v2.0.1 }
+          - { os: windows-latest, platform: windows-x64, dusklight: v2.0.2 }
+          - { os: windows-latest, platform: windows-x64, dusklight: v2.0.3 }
+          - { os: ubuntu-latest,  platform: linux-x64,   dusklight: v2.0.1 }
+          - { os: ubuntu-latest,  platform: linux-x64,   dusklight: v2.0.2 }
+          - { os: ubuntu-latest,  platform: linux-x64,   dusklight: v2.0.3 }
+          - { os: macos-latest,   platform: macos-arm64, dusklight: v2.0.1 }
+          - { os: macos-latest,   platform: macos-arm64, dusklight: v2.0.2 }
+          - { os: macos-latest,   platform: macos-arm64, dusklight: v2.0.3 }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
