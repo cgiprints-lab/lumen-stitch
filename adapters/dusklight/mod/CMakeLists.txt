@@ -21,8 +21,9 @@ add_subdirectory("${DUSKLIGHT_DIR}/sdk" dusklight-sdk EXCLUDE_FROM_ALL)
 configure_file(mod.json.in "${CMAKE_CURRENT_BINARY_DIR}/mod.json" @ONLY NEWLINE_STYLE LF)
 
 add_mod(lumen_photo
-        FEATURES fmt           # M1 adds `game` (freeze hooks); M2 adds `webgpu` (GfxService)
+        FEATURES fmt game webgpu
         SOURCES
             src/mod.cpp
         MOD_JSON "${CMAKE_CURRENT_BINARY_DIR}/mod.json"
 )
+target_include_directories(lumen_photo PRIVATE third_party)
