@@ -154,15 +154,26 @@ struct FacePose {
     double pitch; // radians
     int row, col;
 };
-inline constexpr double kCube360Fovy = 90.0; // degrees, vertical
+inline constexpr double kCube360Fovy = 90.0; // degrees, vertical (side faces)
+
+// The up/down faces stop 2.5 degrees shy of straight up/down and widen to 95
+// degrees vertical. Game cameras build their view matrix from eye+center with
+// a fixed world up; at exactly +/-90 degrees the forward vector is parallel
+// to up, the lookAt degenerates and Dusklight hard-crashes the moment such a
+// pose is applied (measured 2026-11-26: 360 jobs died at the 5th face). The
+// tilt keeps full coverage: the face spans pitch 87.5-47.5 = 40 to 135, so
+// the 45-degree seam ring against the side faces keeps ~5 degrees of overlap,
+// and the zenith/nadir are comfortably inside.
+inline constexpr double kCube360PolePitch = 87.5;  // degrees
+inline constexpr double kCube360PoleFovy = 95.0;   // degrees, vertical
 
 inline void cube360_faces(double yaw, FacePose out[6]) {
-    out[0] = {yaw, 0.0, 0, 1};               // front
-    out[1] = {yaw + rad(90.0), 0.0, 0, 0};   // right
-    out[2] = {yaw + rad(180.0), 0.0, 0, 3};  // back
-    out[3] = {yaw - rad(90.0), 0.0, 0, 2};   // left
-    out[4] = {yaw, rad(90.0), 1, 1};         // up
-    out[5] = {yaw, -rad(90.0), 1, 3};        // down
+    out[0] = {yaw, 0.0, 0, 1};                        // front
+    out[1] = {yaw + rad(90.0), 0.0, 0, 0};            // right
+    out[2] = {yaw + rad(180.0), 0.0, 0, 3};           // back
+    out[3] = {yaw - rad(90.0), 0.0, 0, 2};            // left
+    out[4] = {yaw, rad(kCube360PolePitch), 1, 1};     // up (was exactly 90: crashes)
+    out[5] = {yaw, -rad(kCube360PolePitch), 1, 3};    // down
 }
 
 // Precomputed linear map from continuous master pixel coords to tile pixels:

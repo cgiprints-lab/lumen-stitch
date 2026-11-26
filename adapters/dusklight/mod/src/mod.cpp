@@ -895,7 +895,9 @@ void build_cube_tiles(uint32_t vw, uint32_t vh) {
         def.col = f.col;
         def.yaw = f.yaw;
         def.pitch = f.pitch;
-        def.fovy = tilemath::kCube360Fovy;
+        // Pole faces are tilted off exact vertical (the game's lookAt cannot
+        // represent it) and carry the matching wider fovy.
+        def.fovy = f.row == 1 ? tilemath::kCube360PoleFovy : tilemath::kCube360Fovy;
         def.x0 = static_cast<uint32_t>(f.col) * vw;
         def.y0 = static_cast<uint32_t>(f.row) * vh;
         def.x1 = def.x0 + vw;
@@ -1104,7 +1106,7 @@ void record_job_tile() {
             kind == JobState::CUBE360   ? "faces"
                 : kind == JobState::STEREO ? "views"
                                            : "tiles");
-        push_photo_toast("Lumen Photo Mode", body, "success", 8000);
+        push_photo_toast("Lumen Photo Mode", body, "success", 5000);
         mods::log::info("lumen: {} job {} complete ({} parts)",
             kind == JobState::CUBE360   ? "360"
                 : kind == JobState::STEREO ? "stereo"
@@ -1157,7 +1159,7 @@ void enter_photo_mode() {
     else
         std::snprintf(body, sizeof(body),
             "Photo mode on (world freeze unavailable in this build). Press F1 to return to the game.");
-    push_photo_toast("Lumen Photo Mode", body, "info", 12000);
+    push_photo_toast("Lumen Photo Mode", body, "info", 6000);
     if (!cfg_bool(g_var_seen_controls, false)) {
         if (g_var_seen_controls)
             svc_config->set_bool(mod_ctx, g_var_seen_controls, true);
@@ -1251,8 +1253,8 @@ void apply_flight_input(float dt) {
     if (key_held(VK_RIGHT)) g_photo.yaw -= look * dt;
     if (key_held(VK_UP)) g_photo.pitch += look * dt;
     if (key_held(VK_DOWN)) g_photo.pitch -= look * dt;
-    if (g_photo.pitch > 1.55f) g_photo.pitch = 1.55f;
-    if (g_photo.pitch < -1.55f) g_photo.pitch = -1.55f;
+    if (g_photo.pitch > 1.4835f) g_photo.pitch = 1.4835f;  // 85 deg: the game's
+    if (g_photo.pitch < -1.4835f) g_photo.pitch = -1.4835f; // lookAt dies near 90
     if (key_held(VK_PRIOR)) g_photo.fovy += 30.0f * dt;
     if (key_held(VK_NEXT)) g_photo.fovy -= 30.0f * dt;
     if (g_photo.fovy < 5.0f) g_photo.fovy = 5.0f;
