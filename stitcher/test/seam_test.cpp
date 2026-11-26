@@ -101,7 +101,8 @@ uint64_t rd(std::FILE* f, int bytes) {
 bool read_ifd(std::FILE* f, uint64_t off, std::vector<IfdEntry>& out, uint64_t& next) {
     if (std::fseek(f, static_cast<long>(off), SEEK_SET) != 0)
         return false;
-    const uint64_t n = rd(f, 2);
+    // BigTIFF: entry count is 8 bytes (classic TIFF: 2).
+    const uint64_t n = rd(f, 8);
     out.clear();
     for (uint64_t i = 0; i < n; ++i) {
         IfdEntry e;
@@ -270,6 +271,14 @@ void test_stitch(const std::filesystem::path& tmp) {
     uint64_t next = 0;
     const bool parsed = read_ifd(f, ifd0_off, ifd0, next);
     check(parsed, "IFD0 parses");
+    {
+        // Spec: IFD entries must be sorted by tag (Photoshop stops reading at
+        // the first out-of-order entry and renders the image black).
+        bool sorted = true;
+        for (size_t i = 1; i < ifd0.size(); ++i)
+            sorted = sorted && ifd0[i - 1].tag < ifd0[i].tag;
+        check(sorted, "IFD entries sorted by tag");
+    }
     auto get = [&](uint16_t tag) -> uint64_t {
         const auto* e = find_entry(ifd0, tag);
         return e ? e->value : 0;
@@ -281,10 +290,16 @@ void test_stitch(const std::filesystem::path& tmp) {
     check(offs && offs->count == 1 && cnts && cnts->count == 1, "1x1 tile grid tables");
     std::vector<uint8_t> raster(static_cast<size_t>(128) * 96 * 3);
     if (offs && cnts) {
-        std::fseek(f, static_cast<long>(offs->value), SEEK_SET);
-        const uint64_t tile_off = rd(f, 8);
-        std::fseek(f, static_cast<long>(cnts->value), SEEK_SET);
-        const uint64_t tile_cnt = rd(f, 8);
+        // A count==1 LONG8 array is stored inline in the value field (TIFF
+        // rules on byte size, not on writer preference).
+        const uint64_t tile_off = offs->count == 1 ? offs->value : [&] {
+            std::fseek(f, static_cast<long>(offs->value), SEEK_SET);
+            return rd(f, 8);
+        }();
+        const uint64_t tile_cnt = cnts->count == 1 ? cnts->value : [&] {
+            std::fseek(f, static_cast<long>(cnts->value), SEEK_SET);
+            return rd(f, 8);
+        }();
         check(tile_cnt == 128ull * 96 * 3, "tile byte count = full image (uncompressed RGB)");
         std::fseek(f, static_cast<long>(tile_off), SEEK_SET);
         std::vector<uint8_t> data(tile_cnt);
@@ -296,7 +311,7 @@ void test_stitch(const std::filesystem::path& tmp) {
                 for (int c = 0; c < 3; ++c)
                     raster[(y * 128 + x) * 3 + c] = data[(y * 128 + x) * 3 + c];
     }
-    const auto* subifds = find_entry(ifd0, 33005);
+    const auto* subifds = find_entry(ifd0, 330);
     check(subifds && subifds->count >= 2, "SubIFD mip chain present (>= 2 levels)");
     if (subifds) {
         std::fseek(f, static_cast<long>(subifds->value), SEEK_SET);
@@ -307,7 +322,7 @@ void test_stitch(const std::filesystem::path& tmp) {
             const auto* w = find_entry(mip_ifd, 256);
             const auto* h = find_entry(mip_ifd, 257);
             check(w && w->value == 64 && h && h->value == 48, "mip level 1 is 64x48");
-            check(find_entry(mip_ifd, 33005) == nullptr, "reduced IFD has no SubIFDs tag");
+            check(find_entry(mip_ifd, 330) == nullptr, "reduced IFD has no SubIFDs tag");
         } else {
             check(false, "mip IFD parses");
         }

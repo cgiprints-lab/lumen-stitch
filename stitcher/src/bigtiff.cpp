@@ -19,7 +19,10 @@ constexpr uint16_t kTagTileWidth = 322;
 constexpr uint16_t kTagTileLength = 323;
 constexpr uint16_t kTagTileOffsets = 324;
 constexpr uint16_t kTagTileByteCounts = 325;
-constexpr uint16_t kTagSubIFDs = 33005;
+// Standard SubIFD tag (LibTIFF, GDAL, Photoshop pyramid readers all key on
+// 330). An early build used a private tag (33005) which spec-compliant
+// readers ignore; do not change it back.
+constexpr uint16_t kTagSubIFDs = 330;
 
 constexpr uint16_t kTypeShort = 3;
 constexpr uint16_t kTypeAscii = 2;
@@ -114,26 +117,49 @@ bool BigTiffWriter::close(std::string& err) {
         put64(f_, value);
     };
 
+    // SHORT array entry inlined in the 8-byte value field (spp <= 4 shorts
+    // fit inline in BigTIFF; our streams are RGB).
+    auto entry_bits = [&](uint16_t tag, uint64_t count, uint16_t v) {
+        put16(f_, tag);
+        put16(f_, kTypeShort);
+        put64(f_, count);
+        uint64_t packed = 0;
+        for (uint64_t i = 0; i < count && i < 4; ++i)
+            packed |= static_cast<uint64_t>(v) << (16 * i);
+        put64(f_, packed);
+    };
+
     for (size_t l = 0; l < n; ++l) {
         const Level& L = levels_[l];
         ifd_offsets[l] = static_cast<uint64_t>(std::ftell(f_));
         size_t entries = 14;
         if (l != 0)
             entries -= 1;  // no SubIFDs on reduced levels
-        put16(f_, static_cast<uint16_t>(entries));
+        // BigTIFF IFD entry count is a uint64 (classic TIFF uses uint16 -
+        // writing it short misaligns the whole IFD and readers report an
+        // unexpected EOF; the seam test's reader once mirrored the bug).
+        put64(f_, entries);
         entry(kTagNewSubfileType, kTypeShort, 1, l == 0 ? 0 : 1);
         entry(kTagImageWidth, kTypeLong8, 1, L.width);
         entry(kTagImageLength, kTypeLong8, 1, L.height);
-        entry(kTagBitsPerSample, kTypeShort, 1, 8);
+        // Classic TIFF requires one BitsPerSample value PER SAMPLE for RGB.
+        entry_bits(kTagBitsPerSample, spp_, 8);
         entry(kTagCompression, kTypeShort, 1, 1);  // none
         entry(kTagPhotometric, kTypeShort, 1, 2);  // RGB
         entry(kTagSamplesPerPixel, kTypeShort, 1, spp_);
         entry(kTagPlanarConfig, kTypeShort, 1, 1);
+        // TIFF mandates entries in ascending tag order - Photoshop's reader
+        // stops at the first out-of-order entry and loses the tile tags
+        // (renders the image black), so Software must precede the tile tags.
+        entry(kTagSoftware, kTypeAscii, std::strlen(kSoftware) + 1, software_pos[l]);
         entry(kTagTileWidth, kTypeLong8, 1, L.tileW);
         entry(kTagTileLength, kTypeLong8, 1, L.tileH);
-        entry(kTagTileOffsets, kTypeLong8, offsets_[l].size(), tile_offsets_pos[l]);
-        entry(kTagTileByteCounts, kTypeLong8, counts_[l].size(), tile_counts_pos[l]);
-        entry(kTagSoftware, kTypeAscii, std::strlen(kSoftware) + 1, software_pos[l]);
+        // A single LONG8 array element (<= 8 bytes) must be stored INLINE in
+        // the value field, not as a pointer - readers key on byte count, and
+        // deep pyramid levels have exactly one tile.
+        const uint64_t nt = offsets_[l].size();
+        entry(kTagTileOffsets, kTypeLong8, nt, nt == 1 ? offsets_[l][0] : tile_offsets_pos[l]);
+        entry(kTagTileByteCounts, kTypeLong8, nt, nt == 1 ? counts_[l][0] : tile_counts_pos[l]);
         if (l == 0)
             entry(kTagSubIFDs, kTypeLong8, n - 1, subifd_array_pos_);
         put64(f_, 0);  // next IFD: chain intentionally unlinked (SubIFDs carry mips)
