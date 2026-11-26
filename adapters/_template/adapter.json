@@ -1,0 +1,24 @@
+{
+  "id": "_template",
+  "name": "Adapter template (not installable)",
+  "detection": {
+    "data_dirs": ["~/.lumen/_template-does-not-exist"],
+    "mod_subdir": "mods",
+    "markers": ["game.marker"]
+  },
+  "integration": {
+    "mod_id": "com.example.photo",
+    "bundle": "example_photo.mod",
+    "source_dir": "mod",
+    "cmake_target": "example_photo"
+  },
+  "versions": {
+    "verified": [],
+    "ci_matrix": [],
+    "built_for": "0.0.0",
+    "fallback": "fill in: which game versions one artifact family serves, and what degrades on older ones"
+  },
+  "artifacts": {
+    "windows-x64": "artifacts/windows-x64/example_photo.mod"
+  }
+}

@@ -1,0 +1,131 @@
+// integration.cc.example — structural outline of a Lumen game integration.
+//
+// Not buildable as-is: host_* calls stand in for the game's mod API. The
+// working reference is adapters/dusklight/mod/src/mod.cpp; this file shows
+// the shape every adapter needs, in the order the contract asks for it.
+// Rename to a real source file and map every host_* to the game's SDK.
+//
+// Shared with the stitcher (vendor it in, do not fork the math):
+#include "common/tilemath.h"
+
+namespace lumen_tpl {
+
+// ------------------------------------------------------------- host probes
+// Resolve every optional subsystem at load; each degrades independently.
+// The floor is 1x HUD-free capture: without it, photo mode stays off with
+// an explanation (contract section 3).
+struct FeatureFlags {
+    bool capture = false;   // pre-HUD snapshot point + readback -> PNG
+    bool freeze = false;    // simulation freeze without killing render/update
+    bool autoexit = false;  // session ends on scene/level change
+    bool strip = false;     // screen-space/temporal effects can be held off
+};
+FeatureFlags probe_host();
+
+// ------------------------------------------------------------- photo session
+struct PhotoState {
+    bool active = false;
+    bool frozen = false;
+    // Camera pose owned by the integration; seeded from the game camera on
+    // first control frame. Yaw/pitch radians, Y-up (contract section 2).
+    double eye[3] = {0, 0, 0};
+    double yaw = 0, pitch = 0, fovy = 90.0;
+};
+PhotoState g_photo;
+
+// Called by the game's mod API each frame while the session owns the camera.
+// Return false to hand the camera back. This is the ONLY source of camera
+// poses: tile aiming and the operator must come from the same numbers.
+bool photo_operate(CameraFrame* cam);
+
+void enter_photo_mode();  // register camera override, freeze, hide HUD input
+void exit_photo_mode();   // undo everything; also force-called on scene change
+
+// ------------------------------------------------------------- capture floor
+// One RGBA8 PNG of the pre-HUD scene at native viewport size, written via
+// the host file API to the user's capture folder. State machine:
+//   settle countdown -> issue snapshot/readback -> wait map/encode -> write.
+// Watchdogs (contract): a stalled readback or failing snapshot ENDS the
+// attempt; during a job it also ends the job (never re-arm a failing tile).
+enum Phase { NONE, WAIT_SETTLE, WAIT_COPY, WAIT_MAP, ENCODING };
+struct Capture {
+    Phase phase = NONE;
+    int settle_left = 0;   // configurable: frames presented before snapshot
+    int stall_frames = 0;  // watchdog budget; expiry aborts with an error
+    bool for_job = false;
+    uint32_t width = 0, height = 0;
+};
+Capture g_capture;
+
+void begin_capture(const char* file_name, bool for_job);
+// per-frame pump: decrement settle, poll map completion, encode PNG, write,
+// then either toast (1x) or record the job tile (below).
+
+// ------------------------------------------------------------- jobs
+// Three kinds; all poses come from tilemath so the stitcher agrees exactly.
+//   GRID     S x S projection-offset sub-frustums, one shared eye
+//   CUBE360  six FOV-90 faces from tilemath::cube360_faces
+//   STEREO   L/C/R views, eye translated +/- ipd/2 along camera right
+struct Job {
+    enum Kind { GRID, CUBE360, STEREO } kind = GRID;
+    bool active = false, build_pending = false;
+    uint64_t id = 0;      // timestamp; names every file of the job
+    uint32_t S = 1;       // grid: tiles per side
+    struct TileDef {
+        char name[64];    // flat file name, e.g. lumen-<id>-r0-c1.png
+        double yaw, pitch, fovy;
+        double ox = 0, oy = 0, oz = 0;  // eye translation (stereo only)
+        uint32_t x0, y0, x1, y1;        // rect in master space
+        uint32_t row = 0, col = 0;
+    };
+    std::vector<TileDef> tiles;
+    size_t idx = 0;
+    std::string json;     // manifest body accumulated as tiles complete
+    uint32_t master_w = 0, master_h = 0, vw = 0, vh = 0;
+    uint32_t color_format = 0;  // probe of the scene color target
+};
+Job g_job;
+
+// Tile rects/poses: GRID splits the master frustum (cap master extent,
+// reference 65536 px/side); STEREO lays 3 views side by side; CUBE360 uses
+// the atlas slots. All computed AFTER the real viewport size is known.
+void build_job_tiles(uint32_t viewport_w, uint32_t viewport_h);
+
+// Per frame while a job runs: point the camera at tiles[idx] (yaw/pitch/fovy
+// + eye offset for stereo), begin_capture(tile.name, true). When a tile is
+// written, append its manifest entry and advance idx:
+void record_job_tile() {
+    const Job::TileDef& t = g_job.tiles[g_job.idx];
+    // contract: every entry carries file/row/col/yaw/pitch/fovy/width/
+    // height/rect, and "eye" always when nonzero (or always, simplest):
+    //   {"file":"...","row":R,"col":C,"yaw":Y,"pitch":P,"fovy":F,
+    //    "width":W,"height":H,"eye":[X,Y,Z],"rect":[x0,y0,x1,y1]}
+}
+
+// On the last tile: write <prefix>-<id>.json ONCE, whole, after every tile
+// succeeded. A partial job writes no manifest. Restore stripped effects.
+void complete_job();
+
+// ------------------------------------------------------------- effect strip
+// Around a job: snapshot screen-space/temporal effect state (vignette,
+// motion blur, TAA, grain, fades, bloom, HUD), force it off, re-assert once
+// per frame (game writes must not leak into a tile), restore at job end.
+void strip_begin();
+void strip_repin();  // per frame while g_job.active
+void strip_end();
+
+// ------------------------------------------------------------- manifest head
+// Written at complete_job; schema in docs/adapter-contract.md section 2:
+//   {"lumenJob":1,"layout":"gigapixel|cube360|stereo","scale":S,
+//    "colorFormat":N,"master":{yaw,pitch,fovy,vw,vh,width,height},"tiles":[...]}
+const char* layout_name(Job::Kind k);
+
+// ------------------------------------------------------------- glue TODOs
+// 1. Hotkey/session plumbing: map a key to enter_photo_mode + each job kind.
+// 2. Input: WASD/QE flight + look + FOV, applied inside photo_operate.
+// 3. Config: capture folder, scale, settle frames, ipd, effect toggles,
+//    persisted through the host config API.
+// 4. UI: status line + progress + toasts through the host UI API.
+// 5. Feature log: print the flag set once at load (support reports).
+
+}  // namespace lumen_tpl

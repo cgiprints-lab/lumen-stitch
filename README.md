@@ -86,8 +86,17 @@ restart.
   future redressers). Capture jobs are watchdogged (stalled readback, failing
   tile, unreachable viewport probe all end the job with an error instead of
   hanging or spamming); a CI matrix builds the tools on Windows/Linux/macOS
-  and produces the authoritative MSVC `.dusk` artifact on push.
-- **M5**: adapter contract v1, second game adapter.
+  and the mod matrix compiles across Dusklight v2.0.1–v2.0.3 per platform —
+  at runtime every subsystem (capture/freeze/auto-exit/consistency) gates
+  independently, so an older Dusklight keeps the 1× capture floor instead of
+  half-running.
+- **M5** (done): adapter contract v1 — `docs/adapter-contract.md` specifies
+  the three pieces every game adapter supplies (adapter.json schema, the
+  `lumenJob` tile/manifest job format with its geometry conventions, and the
+  CI artifact matrix), plus capture-state rules, the feature-degradation
+  floor, and the acceptance checklist; `adapters/_template/` carries the
+  copyable skeleton (manifest, integration outline, CMake shape). The
+  stitcher and manager need zero changes for a conformant new game.
 
 See `docs/adapter-contract.md` for how to add a new game.
 

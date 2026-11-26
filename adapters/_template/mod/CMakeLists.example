@@ -1,0 +1,28 @@
+# CMakeLists.example — build shape for a Lumen integration.
+#
+# Copy to CMakeLists.txt, point DUSKLIGHT_DIR-style variables at the game's
+# SDK/mod-template machinery, and align target/bundle names with
+# adapter.json (integration.cmake_target / integration.bundle).
+cmake_minimum_required(VERSION 3.26)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+project(example_photo VERSION 0.1.0 LANGUAGES CXX)
+
+# 1. The game's mod SDK. Prefer the pattern the Dusklight adapter uses: a
+#    Fetch<game>.cmake that pins a release tag, so the CI version matrix
+#    (-DGAME_VERSION=vX.Y.Z) builds the fallback axis for free.
+# include(cmake/FetchGameSdk.cmake)
+# add_subdirectory("${GAME_SDK_DIR}/sdk" game-sdk EXCLUDE_FROM_ALL)
+
+# 2. Shared tile math from the lumen repo - vendor, never fork.
+#    Keep the include dir so `#include "common/tilemath.h"` matches the
+#    stitcher's copy exactly.
+# target_include_directories(<the integration target> PRIVATE ${CMAKE_SOURCE_DIR}/../../..)
+
+# 3. The bundle rule comes from the game's mod-template (add_mod or its
+#    equivalent): sources + manifest metadata -> one loadable bundle.
+# add_mod(example_photo SOURCES src/integration.cc ...)
+
+# 4. CI uploads the produced bundle per platform slug, matching
+#    adapter.json artifacts: windows-x64 / linux-x64 / macos-arm64 /
+#    android-arm64. See .github/workflows/build.yml.
