@@ -7,3 +7,5 @@ adapters/*/mod/dusklight/
 # integration bundles downloaded from CI (not source)
 adapters/*/artifacts/
 
+
+artifacts/

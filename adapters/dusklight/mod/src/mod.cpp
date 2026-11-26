@@ -179,24 +179,31 @@ JobState g_job;
 // are left alone. While a job runs:
 //   haze   - drawCloudShadow skipped per frame (pre-hook, HOOK_SKIP_ORIGINAL),
 //   bloom  - mDoGph_gInf_c::m_bloom.mEnable (offset 0x08 in bloom_c) pinned off,
-//   fade   - mDoGph_gInf_c::mFade pinned to 0.0f,
-//   blur   - mDoGph_gInf_c::mBlureFlag pinned off.
+//   fade   - mDoGph_gInf_c::mFade (u8) pinned to 0,
+//   blur   - mDoGph_gInf_c::mBlureFlag (u8) pinned off.
 // The data symbols are resolved once at load (the manifest carries non-exported
 // statics too); each one degrades to "not available" on MOD_UNAVAILABLE or
-// MOD_CONFLICT rather than failing the mod.
+// MOD_CONFLICT rather than failing the mod. Static *data* is keyed by its
+// mangled name in the manifest (symgen pulls PDB data records verbatim), so
+// each pin tries the mangled spelling first, then the qualified one in case
+// a DISPLAY alias exists. Sizes must match the declared type exactly - mFade
+// and mBlureFlag are u8, pinning 4 bytes would clobber the neighbour.
 struct DataPin {
-    const char* symbol = nullptr; // manifest name to resolve
-    size_t offset = 0;            // field offset inside the resolved object
-    size_t size = 0;              // bytes pinned (4: float / flag + padding)
-    ConfigVarHandle toggle = 0;   // user opt-out var
-    void* addr = nullptr;         // resolved address (null = unavailable)
-    unsigned char saved[8] = {0}; // original bytes, snapshotted at job start
+    const char* symbol = nullptr;      // first-choice manifest name
+    const char* alt_symbol = nullptr;  // fallback spelling (null = none)
+    size_t offset = 0;                 // field offset inside the resolved object
+    size_t size = 0;                   // bytes pinned (exact type size)
+    ConfigVarHandle toggle = 0;        // user opt-out var
+    void* addr = nullptr;              // resolved address (null = unavailable)
+    unsigned char saved[8] = {0};      // original bytes, snapshotted at job start
     bool pinned = false;
 };
 DataPin g_pins[] = {
-    {"mDoGph_gInf_c::m_bloom", 0x08, 4, 0, nullptr, {}, false},
-    {"mDoGph_gInf_c::mFade", 0, 4, 0, nullptr, {}, false},
-    {"mDoGph_gInf_c::mBlureFlag", 0, 4, 0, nullptr, {}, false},
+    // MSVC: bool -> _N, u8 -> E; bloom_c mangled as PEAVbloom_c@@.
+    {"?mBlureFlag@mDoGph_gInf_c@@3_NA", "mDoGph_gInf_c::mBlureFlag", 0, 1, 0, nullptr, {}, false},
+    {"?mFade@mDoGph_gInf_c@@3EA", "mDoGph_gInf_c::mFade", 0, 1, 0, nullptr, {}, false},
+    {"?m_bloom@mDoGph_gInf_c@@2PEAVbloom_c@@EA", "mDoGph_gInf_c::m_bloom", 0x08, 1, 0,
+        nullptr, {}, false},
 };
 
 bool g_haze_hooked = false; // drawCloudShadow pre-hook installed
@@ -204,6 +211,11 @@ bool g_haze_hooked = false; // drawCloudShadow pre-hook installed
 // Latest world camera, refreshed at GFX_STAGE_SCENE_BEGIN (world-camera stage).
 CameraInfo g_camera = CAMERA_INFO_INIT;
 bool g_camera_valid = false;
+
+// Stage hook handles (the service requires a non-null out-param; the game
+// validates it - passing nullptr fails with MOD_INVALID_ARGUMENT).
+GfxStageHookHandle g_hook_scene_begin = 0;
+GfxStageHookHandle g_hook_frame = 0;
 
 // ------------------------------------------------------------ feature fallback
 //
@@ -255,13 +267,6 @@ int64_t cfg_int(ConfigVarHandle var, int64_t def) {
     return v;
 }
 
-double cfg_float(ConfigVarHandle var, double def) {
-    double v = def;
-    if (var && svc_config->get_float(mod_ctx, var, &v) != MOD_OK)
-        v = def;
-    return v;
-}
-
 bool cfg_bool(ConfigVarHandle var, bool def) {
     bool v = def;
     if (var && svc_config->get_bool(mod_ctx, var, &v) != MOD_OK)
@@ -284,17 +289,24 @@ void cfg_string(ConfigVarHandle var, char* buffer, size_t size) {
 // matching override is unavailable (logged, panel toggle inert).
 void resolve_effect_symbols() {
     for (DataPin& pin : g_pins) {
-        void* addr = nullptr;
-        HookSymbolFlags flags = {};
-        const ModResult r = svc_hook->resolve(mod_ctx, pin.symbol, &addr, &flags);
-        if (r != MOD_OK || !addr) {
-            mods::log::warn("lumen: effect symbol '{}' unavailable ({}); override off",
-                pin.symbol, static_cast<int>(r));
-            continue;
+        const char* names[2] = {pin.symbol, pin.alt_symbol};
+        bool found = false;
+        for (const char* name : names) {
+            if (!name)
+                continue;
+            void* addr = nullptr;
+            HookSymbolFlags flags = {};
+            const ModResult r = svc_hook->resolve(mod_ctx, name, &addr, &flags);
+            if (r == MOD_OK && addr) {
+                pin.addr = addr;
+                mods::log::info("lumen: pinned effect state '{}' flags={:04x}", name,
+                    static_cast<unsigned>(flags));
+                found = true;
+                break;
+            }
         }
-        pin.addr = addr;
-        mods::log::info("lumen: pinned effect state '{}' flags={:04x}", pin.symbol,
-            static_cast<unsigned>(flags));
+        if (!found)
+            mods::log::warn("lumen: effect symbol '{}' unavailable; override off", pin.symbol);
     }
 }
 
@@ -613,7 +625,7 @@ void build_stereo_tiles(uint32_t vw, uint32_t vh) {
     g_job.vw = vw;
     g_job.vh = vh;
     warn_if_not_rgba8();
-    const double ipd = cfg_float(g_var_stereo_ipd, 1.0);
+    const double ipd = static_cast<double>(cfg_int(g_var_stereo_ipd, 100)) / 100.0;
     const double yaw = g_photo.yaw;
     // Camera right in world axes (Y-up): forward is (sin yaw, 0, cos yaw).
     const double rx = std::cos(yaw), rz = -std::sin(yaw);
@@ -820,7 +832,7 @@ void enter_photo_mode() {
     }
     g_photo.active = true;
     g_photo.seeded = false;
-    g_photo.fovy = static_cast<float>(cfg_float(g_var_photo_fov, 90.0));
+    g_photo.fovy = static_cast<float>(cfg_int(g_var_photo_fov, 90));
 
     CameraOperatorDesc desc = CAMERA_OPERATOR_DESC_INIT;
     desc.debug_name = "lumen_photo";
@@ -913,10 +925,10 @@ void apply_flight_input(float dt) {
         // a gigapixel job drives the camera.
         return;
     }
-    float speed = static_cast<float>(cfg_float(g_var_move_speed, 20.0));
+    float speed = static_cast<float>(cfg_int(g_var_move_speed, 20));
     if (key_held(VK_SHIFT))
         speed *= 4.0f;
-    const float look = static_cast<float>(cfg_float(g_var_look_speed, 45.0)) * kDegToRad;
+    const float look = static_cast<float>(cfg_int(g_var_look_speed, 45)) * kDegToRad;
 
     if (key_held(VK_LEFT)) g_photo.yaw += look * dt;
     if (key_held(VK_RIGHT)) g_photo.yaw -= look * dt;
@@ -1388,13 +1400,14 @@ ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
     UiControlDesc ipd = UI_CONTROL_DESC_INIT;
     ipd.kind = UI_CONTROL_NUMBER;
     ipd.label = "Stereo eye separation";
-    ipd.help_rml = "Distance between the left and right capture eyes for stereo jobs, in world "
-                   "units. Larger is stronger 3D but harder to fuse.";
+    ipd.help_rml = "Distance between the left and right capture eyes for stereo jobs, in "
+                   "hundredths of a world unit (100 = one unit). Larger is stronger 3D but "
+                   "harder to fuse.";
     ipd.binding = UI_BINDING_CONFIG_VAR;
     ipd.config_var = g_var_stereo_ipd;
-    ipd.min = 0.01;
-    ipd.max = 20;
-    ipd.suffix = " u";
+    ipd.min = 1;
+    ipd.max = 2000;
+    ipd.suffix = " x0.01u";
     svc_ui->pane_add_control(mod_ctx, panel, &ipd, nullptr);
 
     svc_ui->pane_add_section(mod_ctx, panel, "Gigapixel consistency");
@@ -1442,19 +1455,23 @@ extern "C" {
 MOD_EXPORT ModResult mod_initialize(ModError* error) {
     g_var_capture_scale = register_var_typed("captureScale", CONFIG_VAR_INT, 4, 0);
     g_var_settle_frames = register_var_typed("settleFrames", CONFIG_VAR_INT, 2, 0);
-    g_var_move_speed = register_var_typed("moveSpeed", CONFIG_VAR_FLOAT, 0, 20.0);
-    g_var_look_speed = register_var_typed("lookSpeed", CONFIG_VAR_FLOAT, 0, 45.0);
-    g_var_stereo_ipd = register_var_typed("stereoIpd", CONFIG_VAR_FLOAT, 0, 1.0);
-    g_var_photo_fov = register_var_typed("photoFov", CONFIG_VAR_FLOAT, 0, 90.0);
+    // NUMBER controls bind INT vars only (the UI service type-checks the
+    // binding: CONFIG_VAR_FLOAT is rejected with "type does not match the
+    // control kind"), so the flight/look/FOV settings are ints. stereoIpd is
+    // hundredths of a world unit to keep sub-unit eye separation adjustable.
+    g_var_move_speed = register_var_typed("moveSpeed", CONFIG_VAR_INT, 20, 0);
+    g_var_look_speed = register_var_typed("lookSpeed", CONFIG_VAR_INT, 45, 0);
+    g_var_stereo_ipd = register_var_typed("stereoIpd", CONFIG_VAR_INT, 100, 0);
+    g_var_photo_fov = register_var_typed("photoFov", CONFIG_VAR_INT, 90, 0);
     g_var_capture_folder = register_var_typed("captureFolder", CONFIG_VAR_STRING, 0, 0);
     cfg_string(g_var_capture_folder, g_folder_location, sizeof(g_folder_location));
     g_var_strip_haze = register_var_typed("stripHaze", CONFIG_VAR_BOOL, 1, 0);
     g_var_strip_bloom = register_var_typed("stripBloom", CONFIG_VAR_BOOL, 1, 0);
     g_var_strip_fade = register_var_typed("stripFade", CONFIG_VAR_BOOL, 1, 0);
     g_var_strip_blur = register_var_typed("stripBlur", CONFIG_VAR_BOOL, 1, 0);
-    g_pins[0].toggle = g_var_strip_bloom;
+    g_pins[0].toggle = g_var_strip_blur;
     g_pins[1].toggle = g_var_strip_fade;
-    g_pins[2].toggle = g_var_strip_blur;
+    g_pins[2].toggle = g_var_strip_bloom;
 
     GfxComputeTypeDesc computeDesc = GFX_COMPUTE_TYPE_DESC_INIT;
     computeDesc.label = "lumen_readback";
@@ -1466,16 +1483,17 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
 
     GfxStageHookDesc sceneBeginDesc = GFX_STAGE_HOOK_DESC_INIT;
     sceneBeginDesc.callback = on_scene_begin;
-    if (svc_gfx->register_stage_hook(mod_ctx, GFX_STAGE_SCENE_BEGIN, &sceneBeginDesc, nullptr) !=
-        MOD_OK) {
-        mods::log::warn("lumen: scene-begin stage hook failed");
+    ModResult r = svc_gfx->register_stage_hook(mod_ctx, GFX_STAGE_SCENE_BEGIN, &sceneBeginDesc,
+                                               &g_hook_scene_begin);
+    if (r != MOD_OK) {
+        mods::log::warn("lumen: scene-begin stage hook failed ({})", static_cast<int>(r));
         gfx_ready = false;
     }
     GfxStageHookDesc frameDesc = GFX_STAGE_HOOK_DESC_INIT;
     frameDesc.callback = on_frame_before_hud;
-    if (svc_gfx->register_stage_hook(mod_ctx, GFX_STAGE_FRAME_BEFORE_HUD, &frameDesc, nullptr) !=
-        MOD_OK) {
-        mods::log::warn("lumen: frame stage hook failed");
+    r = svc_gfx->register_stage_hook(mod_ctx, GFX_STAGE_FRAME_BEFORE_HUD, &frameDesc, &g_hook_frame);
+    if (r != MOD_OK) {
+        mods::log::warn("lumen: frame stage hook failed ({})", static_cast<int>(r));
         gfx_ready = false;
     }
     // Older GfxService minors without the resolve/readback entry points fail
@@ -1569,6 +1587,18 @@ MOD_EXPORT ModResult mod_shutdown(ModError* error) {
     if (g_operator) {
         svc_camera->unregister_camera_operator(mod_ctx, g_operator);
         g_operator = 0;
+    }
+    if (g_hook_scene_begin) {
+        svc_gfx->unregister_stage_hook(mod_ctx, g_hook_scene_begin);
+        g_hook_scene_begin = 0;
+    }
+    if (g_hook_frame) {
+        svc_gfx->unregister_stage_hook(mod_ctx, g_hook_frame);
+        g_hook_frame = 0;
+    }
+    if (g_compute_type) {
+        svc_gfx->unregister_compute_type(mod_ctx, g_compute_type);
+        g_compute_type = 0;
     }
     reset_capture_buffers();
     if (g_capture.pipeline) {
