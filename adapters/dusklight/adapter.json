@@ -16,6 +16,12 @@
     "source_dir": "mod",
     "cmake_target": "lumen_photo"
   },
+  "versions": {
+    "verified": ["2.0.2"],
+    "ci_matrix": ["2.0.1", "2.0.2", "2.0.3"],
+    "built_for": "2.0.2",
+    "fallback": "one artifact per platform serves the 2.0.x line; the mod gates features on missing service APIs at load (feature floor: 1x capture; freeze/consistency/hooks degrade independently)"
+  },
   "artifacts": {
     "windows-x64": "artifacts/windows-x64/lumen_photo.dusk",
     "linux-x64": "artifacts/linux-x64/lumen_photo.dusk",

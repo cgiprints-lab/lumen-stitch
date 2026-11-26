@@ -205,6 +205,19 @@ bool g_haze_hooked = false; // drawCloudShadow pre-hook installed
 CameraInfo g_camera = CAMERA_INFO_INIT;
 bool g_camera_valid = false;
 
+// ------------------------------------------------------------ feature fallback
+//
+// Version-fallback matrix at runtime: every subsystem that can be missing on
+// an older Dusklight (fewer service minors, different symbol manifest)
+// degrades independently at load (see mod_initialize). The floor is the 1x
+// capture path - stage hooks + readback compute - and without it photo mode
+// itself stays off with an explanation rather than half-working. The exact
+// set is logged once so support reports can see what a build actually got.
+bool g_feat_capture = false; // stage hooks + compute type -> 1x + jobs
+bool g_feat_freeze = false;  // dusk::game_clock::advance hook
+bool g_feat_autoexit = false; // dStage_changeScene hook
+bool g_feat_strip = false;   // haze hook or >=1 data pin resolved
+
 // Config vars.
 ConfigVarHandle g_var_capture_scale = 0;
 ConfigVarHandle g_var_settle_frames = 0;
@@ -328,6 +341,8 @@ UiElementHandle g_status_text = 0;
 
 const char* status_label() {
     static char buf[128];
+    if (!g_feat_capture)
+        return "capture unavailable in this build (see log)";
     if (g_job.active) {
         if (g_job.build_pending)
             return "capture: measuring viewport...";
@@ -797,6 +812,12 @@ void record_job_tile() {
 void enter_photo_mode() {
     if (g_photo.active)
         return;
+    if (!g_feat_capture) {
+        push_photo_toast("Lumen Photo Mode",
+            "Capture is unavailable in this Dusklight build (graphics stage hooks failed).",
+            "error");
+        return;
+    }
     g_photo.active = true;
     g_photo.seeded = false;
     g_photo.fovy = static_cast<float>(cfg_float(g_var_photo_fov, 90.0));
@@ -812,7 +833,7 @@ void enter_photo_mode() {
 
     // Time freeze: the advance() post-hook zeroes numSimTicks while frozen. Only
     // engage if the hook resolved at load.
-    g_photo.frozen = GameClockAdvance::g_orig != nullptr;
+    g_photo.frozen = g_feat_freeze;
 
     push_photo_toast("Lumen Photo Mode",
         g_photo.frozen
@@ -1438,23 +1459,36 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     GfxComputeTypeDesc computeDesc = GFX_COMPUTE_TYPE_DESC_INIT;
     computeDesc.label = "lumen_readback";
     computeDesc.callback = on_readback_compute;
-    if (svc_gfx->register_compute_type(mod_ctx, &computeDesc, &g_compute_type) != MOD_OK)
+    bool gfx_ready =
+        svc_gfx->register_compute_type(mod_ctx, &computeDesc, &g_compute_type) == MOD_OK;
+    if (!gfx_ready)
         mods::log::warn("lumen: could not register readback compute type");
 
     GfxStageHookDesc sceneBeginDesc = GFX_STAGE_HOOK_DESC_INIT;
     sceneBeginDesc.callback = on_scene_begin;
     if (svc_gfx->register_stage_hook(mod_ctx, GFX_STAGE_SCENE_BEGIN, &sceneBeginDesc, nullptr) !=
-        MOD_OK)
+        MOD_OK) {
         mods::log::warn("lumen: scene-begin stage hook failed");
+        gfx_ready = false;
+    }
     GfxStageHookDesc frameDesc = GFX_STAGE_HOOK_DESC_INIT;
     frameDesc.callback = on_frame_before_hud;
     if (svc_gfx->register_stage_hook(mod_ctx, GFX_STAGE_FRAME_BEFORE_HUD, &frameDesc, nullptr) !=
-        MOD_OK)
+        MOD_OK) {
         mods::log::warn("lumen: frame stage hook failed");
+        gfx_ready = false;
+    }
+    // Older GfxService minors without the resolve/readback entry points fail
+    // here; the mod stays loaded but photo mode is gated off (feature floor).
+    g_feat_capture = gfx_ready;
+    if (!g_feat_capture)
+        mods::log::warn("lumen: capture path unavailable - degraded, photo mode stays off");
 
-    if (mods::hook::add_post<GameClockAdvance>(on_advance_post) != MOD_OK)
+    g_feat_freeze = mods::hook::add_post<GameClockAdvance>(on_advance_post) == MOD_OK;
+    if (!g_feat_freeze)
         mods::log::warn("lumen: game clock hook unavailable; time freeze disabled");
-    if (mods::hook::add_pre<StageChangeScene>(on_stage_change_pre) != MOD_OK)
+    g_feat_autoexit = mods::hook::add_pre<StageChangeScene>(on_stage_change_pre) == MOD_OK;
+    if (!g_feat_autoexit)
         mods::log::warn("lumen: stage change hook unavailable; auto-exit disabled");
     // Gigapixel consistency: haze draw skip + post-effect state pinning. Both
     // are optional; the job still runs (with possible tile-to-tile seams) when
@@ -1464,6 +1498,9 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     else
         mods::log::warn("lumen: cloud-shadow hook unavailable; haze strip disabled");
     resolve_effect_symbols();
+    g_feat_strip = g_haze_hooked;
+    for (const DataPin& pin : g_pins)
+        g_feat_strip = g_feat_strip || pin.addr != nullptr;
 
     UiModsPanelDesc panel = UI_MODS_PANEL_DESC_INIT;
     panel.build = build_panel;
@@ -1473,7 +1510,14 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         return MOD_ERROR;
     }
 
-    mods::log::info("Lumen Photo Mode {} loaded (M3: photo + freeze + gigapixel + consistency)",
+    // No HostService import on purpose: every import raises the service
+    // minor floor the loader will accept, and the host is only interesting
+    // for support chatter. The feature line below says what matters.
+    mods::log::info(
+        "lumen: features: capture {}, freeze {}, auto-exit {}, consistency {}",
+        g_feat_capture ? "yes" : "NO", g_feat_freeze ? "yes" : "no",
+        g_feat_autoexit ? "yes" : "no", g_feat_strip ? "yes" : "no");
+    mods::log::info("Lumen Photo Mode {} loaded (M4: photo + freeze + gigapixel + 360 + stereo)",
         "0.1.0");
     return MOD_OK;
 }

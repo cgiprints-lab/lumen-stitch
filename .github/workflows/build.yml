@@ -33,19 +33,36 @@ jobs:
         shell: bash
         if: matrix.os != 'windows-latest'
 
-  # The in-game mod against the Dusklight SDK. MSVC on Windows is the
-  # authoritative artifact (MinGW cannot emit the loadable .dusk metadata);
-  # macOS/Linux compile-check the source only when the SDK supports them.
-  mod-windows:
-    runs-on: windows-latest
+  # The in-game mod: artifact matrix per platform x Dusklight version. MSVC
+  # Windows, GCC Linux, Clang macOS each produce a loadable .dusk (the SDK
+  # puts mod metadata in PE/ELF/Mach-O sections). The version axis is the
+  # service-version fallback matrix: compiling clean against older 2.0.x
+  # tags is what lets one artifact family serve the whole line, with the
+  # mod's runtime feature flags degrading on missing APIs (never below the
+  # 1x capture floor). Android artifacts need the NDK toolchain and are
+  # intentionally not on hosted runners yet.
+  mod:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows-x64
+          - os: ubuntu-latest
+            platform: linux-x64
+          - os: macos-latest
+            platform: macos-arm64
+        dusklight: [v2.0.1, v2.0.2, v2.0.3]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - name: Configure
-        run: cmake -S adapters/dusklight/mod -B build/mod
+        run: cmake -S adapters/dusklight/mod -B build/mod -DDUSKLIGHT_VERSION=${{ matrix.dusklight }}
       - name: Build
         run: cmake --build build/mod --config RelWithDebInfo
-      - name: Upload .dusk
+      - name: Upload .dusk (baseline build)
         uses: actions/upload-artifact@v4
+        if: matrix.dusklight == 'v2.0.2'
         with:
-          name: lumen_photo-windows
+          name: lumen_photo-${{ matrix.platform }}
           path: build/mod/mods/*.dusk
