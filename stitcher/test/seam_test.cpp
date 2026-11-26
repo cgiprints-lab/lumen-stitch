@@ -10,7 +10,8 @@
 //     chain, and a decodable JPEG preview.
 //  4. downsample path: composite_scaled box-average matches the exact master
 //     grid downsample; run() level-0 dims are ceil(master / N).
-//  5. cube360 -> equirectangular: six FOV-90 faces stitch to an exact 2:1
+//  5. cube360 -> equirectangular: six faces (side FOV-90, poles tilted off
+//     vertical with FOV-95) stitch to an exact 2:1
 //     panorama (every pixel, face seams included).
 //  6. stereo trio: eye offsets parse, 1:1 side-by-side paste matches a
 //     per-eye reference exactly (parallax preserved, no shared-eye warp).
@@ -477,7 +478,11 @@ void test_cube360(const std::filesystem::path& tmp) {
         lumen::tilemath::Tile t;
         t.yaw = faces[i].yaw;
         t.pitch = faces[i].pitch;
-        t.fovy = lumen::tilemath::kCube360Fovy;
+        // Same convention the mod writes: pole faces are tilted off exact
+        // vertical (game lookAt cannot represent 90) and carry a wider fovy
+        // so every panorama pixel stays inside its nearest-axis face.
+        t.fovy = faces[i].row == 1 ? lumen::tilemath::kCube360PoleFovy
+                                   : lumen::tilemath::kCube360Fovy;
         t.w = 64;
         t.h = 48;
         const auto img = render_tile_rgba(t);
