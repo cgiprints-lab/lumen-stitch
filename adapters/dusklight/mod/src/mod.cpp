@@ -1,11 +1,22 @@
 // Lumen Photo Mode - Dusklight integration (Ansel-style photography for Dusklight).
 //
-// M2 scope: photo sessions with a free camera (CameraService operator), time freeze
-// (HookService post-hook on dusk::game_clock::advance zeroing numSimTicks), HUD-free
-// native-resolution capture (GfxService resolve_pass at FRAME_BEFORE_HUD + WebGPU
-// compute readback), hotkeys, capture folder persistence, and gigapixel capture:
-// an S x S grid of sub-frustum re-projections sharing one eye (Ansel's gigapixel
-// model), each tile written as a PNG plus a JSON manifest for `lumen stitch`.
+// M3 scope: everything from M2 (photo sessions with a free camera via a
+// CameraService operator, time freeze via a HookService post-hook on
+// dusk::game_clock::advance, HUD-free native-resolution capture via GfxService
+// resolve_pass at FRAME_BEFORE_HUD + WebGPU compute readback, hotkeys, capture
+// folder persistence, and gigapixel capture: an S x S grid of sub-frustum
+// re-projections sharing one eye - Ansel's gigapixel model - each tile written
+// as a PNG plus a JSON manifest for `lumen stitch`), plus the consistency
+// layer for multi-part shots: while a gigapixel job runs, screen-space and
+// temporal effects that would differ between tiles are suppressed (Ansel's
+// "disable non-uniform and temporal effects for multipart captures" rule):
+//   - moya cloud-shadow haze: pre-hook on drawCloudShadow, skipping the draw
+//     per frame (same pattern as the upstream effect_remover mod), and
+//   - bloom / fade / motion blur: state lives in mDoGph_gInf_c statics, so the
+//     values themselves are pinned to off through HookService::resolve data
+//     symbols and restored when the job ends.
+// Every symbol is resolved from the shipped manifest and each override degrades
+// gracefully (log + skip) when a name is missing or ambiguous.
 //
 // Controls (Windows; panel buttons cover every action on other platforms):
 //   F9  enter / exit photo mode   F10 capture (1x)   F11 gigapixel job
@@ -75,6 +86,10 @@ IMPORT_SERVICE(HookService, svc_hook);
 DEFINE_HOOK_SYMBOL("dusk::game_clock::advance", void*(), GameClockAdvance);
 DEFINE_HOOK_SYMBOL("dStage_changeScene", int(int, float, unsigned, signed char, short, int),
     StageChangeScene);
+// Moya cloud-shadow haze draw entry (d_kankyo_rain.h: drawCloudShadow(Mtx, u8**)).
+// Mtx is a float[3][4] typedef; it decays to a pointer in the call ABI, so the
+// free-style signature below matches the game's trampoline requirements.
+DEFINE_HOOK_SYMBOL("drawCloudShadow", void(float*, unsigned char**), CloudShadow);
 
 namespace {
 
@@ -150,6 +165,36 @@ struct JobState {
 };
 JobState g_job;
 
+// --- gigapixel consistency layer (M3) ---------------------------------------
+// Multi-part shots re-render the same frozen scene from different sub-frusta,
+// so any effect whose output depends on the *viewport* rather than the world
+// (screen-space haze, bloom, fade) or on *time flow* (motion blur) disagrees
+// between tiles. World-space effects stay consistent under the time freeze and
+// are left alone. While a job runs:
+//   haze   - drawCloudShadow skipped per frame (pre-hook, HOOK_SKIP_ORIGINAL),
+//   bloom  - mDoGph_gInf_c::m_bloom.mEnable (offset 0x08 in bloom_c) pinned off,
+//   fade   - mDoGph_gInf_c::mFade pinned to 0.0f,
+//   blur   - mDoGph_gInf_c::mBlureFlag pinned off.
+// The data symbols are resolved once at load (the manifest carries non-exported
+// statics too); each one degrades to "not available" on MOD_UNAVAILABLE or
+// MOD_CONFLICT rather than failing the mod.
+struct DataPin {
+    const char* symbol = nullptr; // manifest name to resolve
+    size_t offset = 0;            // field offset inside the resolved object
+    size_t size = 0;              // bytes pinned (4: float / flag + padding)
+    ConfigVarHandle toggle = 0;   // user opt-out var
+    void* addr = nullptr;         // resolved address (null = unavailable)
+    unsigned char saved[8] = {0}; // original bytes, snapshotted at job start
+    bool pinned = false;
+};
+DataPin g_pins[] = {
+    {"mDoGph_gInf_c::m_bloom", 0x08, 4, 0, nullptr, {}, false},
+    {"mDoGph_gInf_c::mFade", 0, 4, 0, nullptr, {}, false},
+    {"mDoGph_gInf_c::mBlureFlag", 0, 4, 0, nullptr, {}, false},
+};
+
+bool g_haze_hooked = false; // drawCloudShadow pre-hook installed
+
 // Latest world camera, refreshed at GFX_STAGE_SCENE_BEGIN (world-camera stage).
 CameraInfo g_camera = CAMERA_INFO_INIT;
 bool g_camera_valid = false;
@@ -161,6 +206,10 @@ ConfigVarHandle g_var_move_speed = 0;
 ConfigVarHandle g_var_look_speed = 0;
 ConfigVarHandle g_var_photo_fov = 0;
 ConfigVarHandle g_var_capture_folder = 0;
+ConfigVarHandle g_var_strip_haze = 0;
+ConfigVarHandle g_var_strip_bloom = 0;
+ConfigVarHandle g_var_strip_fade = 0;
+ConfigVarHandle g_var_strip_blur = 0;
 
 char g_folder_location[1024] = {0}; // persisted opaque FileService location
 
@@ -170,6 +219,7 @@ ConfigVarHandle register_var_typed(const char* name, ConfigVarType type, int64_t
     ConfigVarDesc desc = CONFIG_VAR_DESC_INIT;
     desc.name = name;
     desc.type = type;
+    desc.default_bool = type == CONFIG_VAR_BOOL && i != 0;
     desc.default_int = i;
     desc.default_float = f;
     ConfigVarHandle var = 0;
@@ -192,12 +242,77 @@ double cfg_float(ConfigVarHandle var, double def) {
     return v;
 }
 
+bool cfg_bool(ConfigVarHandle var, bool def) {
+    bool v = def;
+    if (var && svc_config->get_bool(mod_ctx, var, &v) != MOD_OK)
+        v = def;
+    return v;
+}
+
 void cfg_string(ConfigVarHandle var, char* buffer, size_t size) {
     if (buffer && size)
         buffer[0] = '\0';
     if (!var || !buffer || !size)
         return;
     svc_config->get_string(mod_ctx, var, buffer, size, nullptr);
+}
+
+// ------------------------------------------- effect pins (gigapixel consistency)
+
+// Resolve the mDoGph_gInf_c post-effect state symbols once at load. The names
+// come from the shipped symbol manifest; missing/ambiguous names just mean the
+// matching override is unavailable (logged, panel toggle inert).
+void resolve_effect_symbols() {
+    for (DataPin& pin : g_pins) {
+        void* addr = nullptr;
+        HookSymbolFlags flags = {};
+        const ModResult r = svc_hook->resolve(mod_ctx, pin.symbol, &addr, &flags);
+        if (r != MOD_OK || !addr) {
+            mods::log::warn("lumen: effect symbol '{}' unavailable ({}); override off",
+                pin.symbol, static_cast<int>(r));
+            continue;
+        }
+        pin.addr = addr;
+        mods::log::info("lumen: pinned effect state '{}' flags={:04x}", pin.symbol,
+            static_cast<unsigned>(flags));
+    }
+}
+
+// Snapshot originals then force off, honouring the user toggles.
+void strip_begin() {
+    for (DataPin& pin : g_pins) {
+        pin.pinned = false;
+        if (!pin.addr || !cfg_bool(pin.toggle, true))
+            continue;
+        std::memcpy(pin.saved, static_cast<unsigned char*>(pin.addr) + pin.offset, pin.size);
+        std::memset(static_cast<unsigned char*>(pin.addr) + pin.offset, 0, pin.size);
+        pin.pinned = true;
+    }
+}
+
+// Re-assert the zeros in case the game touched them mid-job (belt and braces;
+// the time freeze normally keeps this state still).
+void strip_repin() {
+    for (DataPin& pin : g_pins) {
+        if (pin.pinned)
+            std::memset(static_cast<unsigned char*>(pin.addr) + pin.offset, 0, pin.size);
+    }
+}
+
+void strip_end() {
+    for (DataPin& pin : g_pins) {
+        if (!pin.pinned)
+            continue;
+        std::memcpy(static_cast<unsigned char*>(pin.addr) + pin.offset, pin.saved, pin.size);
+        pin.pinned = false;
+    }
+}
+
+// drawCloudShadow pre-hook: skip the moya haze draw while a job is running.
+HookAction on_cloud_shadow_pre(ModContext*, void*, void*, void*) {
+    if (g_job.active && g_haze_hooked && cfg_bool(g_var_strip_haze, true))
+        return HOOK_SKIP_ORIGINAL;
+    return HOOK_CONTINUE;
 }
 
 // ---------------------------------------------------------------- ui helpers
@@ -316,6 +431,7 @@ void abort_job(bool notify) {
     if (!g_job.active)
         return;
     g_job.active = false;
+    strip_end();
     g_job.tiles.clear();
     g_job.idx = 0;
     g_job.json.clear();
@@ -361,15 +477,34 @@ void start_gigapixel() {
         std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch())
             .count());
+    strip_begin(); // hold screen-space/temporal effects off for the whole job
     mods::log::info("lumen: gigapixel job {} started ({}x{} tiles)", g_job.id, S, S);
 }
 
 // Build the tile grid once the scene color size is known (probe frame).
 void build_job_tiles(uint32_t vw, uint32_t vh) {
-    const uint32_t S = g_job.S;
-    if (!S) {
+    const uint32_t S0 = g_job.S;
+    if (!S0) {
         abort_job(true);
         return;
+    }
+    // Master dimension cap (Ansel's gigapixel ceiling): the master image is
+    // vw*S x vh*S, so clamp tiles-per-side to keep it inside 65536 px. Known
+    // here, before a single tile renders; nothing wasted.
+    uint32_t cap = 65536u / vw;
+    if (uint32_t caph = 65536u / vh; caph < cap)
+        cap = caph;
+    if (cap < 2)
+        cap = 2;
+    const uint32_t S = S0 < cap ? S0 : cap;
+    if (S != S0) {
+        char body[192];
+        std::snprintf(body, sizeof(body),
+            "Scale limited to %" PRIu32 "x: %" PRIu32 "x on a %" PRIu32 "x%" PRIu32
+            " viewport would exceed the 65536 px master-image cap.",
+            S, S0, vw, vh);
+        push_photo_toast("Lumen Photo Mode", body, "info");
+        g_job.S = S;
     }
     tilemath::Master m;
     m.yaw = g_photo.yaw;
@@ -456,6 +591,7 @@ void record_job_tile() {
     const uint64_t id = g_job.id;
     const size_t tiles = g_job.tiles.size();
     g_job.active = false;
+    strip_end();
     g_job.tiles.clear();
     g_job.json.clear();
     g_photo.fov_override = 0;
@@ -844,6 +980,10 @@ void on_scene_begin(ModContext*, const GfxStageContext* stage, void*) {
 }
 
 void on_frame_before_hud(ModContext*, const GfxStageContext*, void*) {
+    // Effects held off for the job: re-assert the pins once per frame so a
+    // game-side write can never leak into a tile.
+    if (g_job.active)
+        strip_repin();
     // Gigapixel job kickoff: one probe of the scene color size before aiming
     // tiles (the master grid is defined in viewport-sized cells).
     if (g_job.active && g_job.build_pending) {
@@ -1005,6 +1145,35 @@ ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
     fov.suffix = " deg";
     svc_ui->pane_add_control(mod_ctx, panel, &fov, nullptr);
 
+    svc_ui->pane_add_section(mod_ctx, panel, "Gigapixel consistency");
+    struct StripToggleDesc {
+        const char* label;
+        const char* help;
+        ConfigVarHandle var;
+    };
+    const StripToggleDesc stripToggles[] = {
+        {"Strip cloud-shadow haze",
+            "Skips the moya haze draw while a gigapixel job runs. It is screen-space, so it "
+            "would differ between tiles.", g_var_strip_haze},
+        {"Strip bloom",
+            "Turns bloom off during gigapixel jobs (it composites over the viewport).",
+            g_var_strip_bloom},
+        {"Strip fade",
+            "Forces the screen fade to zero during gigapixel jobs.", g_var_strip_fade},
+        {"Strip motion blur",
+            "Turns motion blur off during gigapixel jobs (a temporal effect).",
+            g_var_strip_blur},
+    };
+    for (const StripToggleDesc& t : stripToggles) {
+        UiControlDesc ctl = UI_CONTROL_DESC_INIT;
+        ctl.kind = UI_CONTROL_TOGGLE;
+        ctl.label = t.label;
+        ctl.help_rml = t.help;
+        ctl.binding = UI_BINDING_CONFIG_VAR;
+        ctl.config_var = t.var;
+        svc_ui->pane_add_control(mod_ctx, panel, &ctl, nullptr);
+    }
+
     return MOD_OK;
 }
 
@@ -1026,6 +1195,13 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     g_var_photo_fov = register_var_typed("photoFov", CONFIG_VAR_FLOAT, 0, 90.0);
     g_var_capture_folder = register_var_typed("captureFolder", CONFIG_VAR_STRING, 0, 0);
     cfg_string(g_var_capture_folder, g_folder_location, sizeof(g_folder_location));
+    g_var_strip_haze = register_var_typed("stripHaze", CONFIG_VAR_BOOL, 1, 0);
+    g_var_strip_bloom = register_var_typed("stripBloom", CONFIG_VAR_BOOL, 1, 0);
+    g_var_strip_fade = register_var_typed("stripFade", CONFIG_VAR_BOOL, 1, 0);
+    g_var_strip_blur = register_var_typed("stripBlur", CONFIG_VAR_BOOL, 1, 0);
+    g_pins[0].toggle = g_var_strip_bloom;
+    g_pins[1].toggle = g_var_strip_fade;
+    g_pins[2].toggle = g_var_strip_blur;
 
     GfxComputeTypeDesc computeDesc = GFX_COMPUTE_TYPE_DESC_INIT;
     computeDesc.label = "lumen_readback";
@@ -1048,6 +1224,14 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         mods::log::warn("lumen: game clock hook unavailable; time freeze disabled");
     if (mods::hook::add_pre<StageChangeScene>(on_stage_change_pre) != MOD_OK)
         mods::log::warn("lumen: stage change hook unavailable; auto-exit disabled");
+    // Gigapixel consistency: haze draw skip + post-effect state pinning. Both
+    // are optional; the job still runs (with possible tile-to-tile seams) when
+    // a symbol is missing from this build's manifest.
+    if (mods::hook::add_pre<CloudShadow>(on_cloud_shadow_pre) == MOD_OK)
+        g_haze_hooked = true;
+    else
+        mods::log::warn("lumen: cloud-shadow hook unavailable; haze strip disabled");
+    resolve_effect_symbols();
 
     UiModsPanelDesc panel = UI_MODS_PANEL_DESC_INIT;
     panel.build = build_panel;
@@ -1057,7 +1241,8 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         return MOD_ERROR;
     }
 
-    mods::log::info("Lumen Photo Mode {} loaded (M2: photo + freeze + gigapixel)", "0.1.0");
+    mods::log::info("Lumen Photo Mode {} loaded (M3: photo + freeze + gigapixel + consistency)",
+        "0.1.0");
     return MOD_OK;
 }
 
