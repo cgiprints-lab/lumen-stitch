@@ -973,7 +973,7 @@ void apply_flight_input(float dt) {
         // a gigapixel job drives the camera.
         return;
     }
-    float speed = static_cast<float>(cfg_int(g_var_move_speed, 20));
+    float speed = static_cast<float>(cfg_int(g_var_move_speed, 100));
     if (key_held(VK_SHIFT))
         speed *= 4.0f;
     const float look = static_cast<float>(cfg_int(g_var_look_speed, 45)) * kDegToRad;
@@ -1436,7 +1436,7 @@ ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
     move_speed.binding = UI_BINDING_CONFIG_VAR;
     move_speed.config_var = g_var_move_speed;
     move_speed.min = 1;
-    move_speed.max = 200;
+    move_speed.max = 2000;
     move_speed.suffix = " u/s";
     svc_ui->pane_add_control(mod_ctx, panel, &move_speed, nullptr);
 
@@ -1524,7 +1524,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     // binding: CONFIG_VAR_FLOAT is rejected with "type does not match the
     // control kind"), so the flight/look/FOV settings are ints. stereoIpd is
     // hundredths of a world unit to keep sub-unit eye separation adjustable.
-    g_var_move_speed = register_var_typed("moveSpeed", CONFIG_VAR_INT, 20, 0);
+    g_var_move_speed = register_var_typed("moveSpeed", CONFIG_VAR_INT, 100, 0);
     g_var_look_speed = register_var_typed("lookSpeed", CONFIG_VAR_INT, 45, 0);
     g_var_stereo_ipd = register_var_typed("stereoIpd", CONFIG_VAR_INT, 100, 0);
     g_var_photo_fov = register_var_typed("photoFov", CONFIG_VAR_INT, 90, 0);
@@ -1608,7 +1608,18 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
 MOD_EXPORT ModResult mod_update(ModError* error) {
     (void)error;
     poll_hotkeys();
-    apply_flight_input(1.0f / 60.0f);
+    // Real frame delta: mod_update runs once per render frame, so a fixed
+    // 1/60 makes flight half speed at 120 fps and double at 30. Clamped so
+    // alt-tab hitches or a shader-compile stall can't teleport the camera.
+    static auto s_last = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    float dt = std::chrono::duration<float>(now - s_last).count();
+    s_last = now;
+    if (dt < 0.0005f)
+        dt = 0.0005f;
+    if (dt > 0.1f)
+        dt = 0.1f;
+    apply_flight_input(dt);
 
     // Stall watchdog: a capture whose map never completes (lost device,
     // wedged queue) must not pin photo mode or a job forever. Generous at
