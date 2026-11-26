@@ -1159,7 +1159,7 @@ void enter_photo_mode() {
     else
         std::snprintf(body, sizeof(body),
             "Photo mode on (world freeze unavailable in this build). Press F1 to return to the game.");
-    push_photo_toast("Lumen Photo Mode", body, "info", 6000);
+    push_photo_toast("Lumen Photo Mode", body, "info", 4000);
     if (!cfg_bool(g_var_seen_controls, false)) {
         if (g_var_seen_controls)
             svc_config->set_bool(mod_ctx, g_var_seen_controls, true);
@@ -1185,7 +1185,10 @@ void exit_photo_mode() {
         reset_capture_buffers();
         g_capture.phase = CAPTURE_NONE;
     }
-    push_photo_toast("Lumen Photo Mode", "Photo mode off.");
+    // Short and plain: this is the "you are back" signal; a long toast here
+    // reads like photo mode is still on (reported 2026-11-26). The overlay
+    // has no dismiss API, so bounded duration is the only lever.
+    push_photo_toast("Lumen Photo Mode", "Photo mode off - back to the game.", "info", 2000);
     mods::log::info("lumen: photo mode off");
 }
 
