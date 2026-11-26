@@ -19,8 +19,11 @@
 // gracefully (log + skip) when a name is missing or ambiguous.
 //
 // Controls (Windows; panel buttons cover every action on other platforms):
-//   F9 photo mode   F10 capture 1x   F11 gigapixel   F12 360 pano   F8 stereo trio
+//   F1 photo mode   F7 capture 1x   F12 gigapixel   Shift+F12 360 pano
+//   Shift+F7 stereo trio
 //   WASD move, Q/E down/up, arrows look, Shift boost, PgUp/PgDn field of view.
+// (F8-F11 are the game's own hotkeys - state share, debug camera, audio
+// debug, fullscreen toggle - and must not be claimed.)
 #include "mods/api.h"
 
 #if defined(__MINGW32__)
@@ -50,14 +53,19 @@
 #include <webgpu/webgpu.h>
 
 #include <cinttypes>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "common/tilemath.h"
+#include "stitcher/src/stitch.h"
 
 namespace tilemath = lumen::tilemath;
 
@@ -68,7 +76,9 @@ namespace tilemath = lumen::tilemath;
 #include <windows.h>
 #endif
 
-#define STB_IMAGE_WRITE_IMPLEMENTATION
+// Declarations only: stitch.cpp (compiled into this module) owns the stb
+// implementations (both image read and write) - defining them here too would
+// duplicate every stb_image_write symbol at link time.
 #include "stb_image_write.h"
 
 DEFINE_MOD();
@@ -123,6 +133,16 @@ struct PhotoState {
     float fovy = 90; // degrees
     float fov_override = 0; // per-tile FOV during a gigapixel job (0 = none)
     float eye_off[3] = {0, 0, 0}; // per-tile eye shift (stereo); 0 for grid/360
+    // The operator mutates the game's live camera state, so the pose it had
+    // before we took over is captured at seed time and handed back for a few
+    // frames on exit - otherwise the game resumes from the photo pose and
+    // can stay parked at whatever zoom/angle the shot left behind.
+    bool have_saved = false;
+    int restore_frames = 0;
+    float saved_eye[3] = {0, 0, 0};
+    float saved_center[3] = {0, 0, 0};
+    float saved_fovy = 0;
+    float saved_bank = 0;
 };
 PhotoState g_photo;
 
@@ -262,6 +282,16 @@ ConfigVarHandle g_var_stereo_ipd = 0;
 ConfigVarHandle g_var_photo_fov = 0;
 ConfigVarHandle g_var_capture_folder = 0;
 ConfigVarHandle g_var_strip_haze = 0;
+ConfigVarHandle g_var_auto_stitch = 0;
+
+// Background-stitch state (worker thread <-> game thread). See the section
+// near folder handling for the full contract.
+std::thread g_stitch_worker;
+std::atomic<bool> g_stitch_running{false};
+std::atomic<uint32_t> g_stitch_percent{0};
+std::mutex g_stitch_mtx;
+std::string g_stitch_done;   // non-empty = finished, awaiting toast on game thread
+bool g_stitch_done_ok = false;
 ConfigVarHandle g_var_strip_bloom = 0;
 ConfigVarHandle g_var_strip_fade = 0;
 ConfigVarHandle g_var_strip_blur = 0;
@@ -388,7 +418,13 @@ const char* status_label() {
         return buf;
     }
     if (!g_photo.active)
-        return "photo mode: off (F9)";
+        return "photo mode: off (F1)";
+    if (g_stitch_running) {
+        static char sbuf[64];
+        std::snprintf(sbuf, sizeof(sbuf), "background stitch: %" PRIu32 "%%",
+            g_stitch_percent.load());
+        return sbuf;
+    }
     return g_photo.frozen ? "photo mode: ON, time frozen"
                           : "photo mode: ON, time running";
 }
@@ -405,8 +441,23 @@ void push_photo_toast(const char* title, const char* body, const char* type = "s
 // ---------------------------------------------------------------- camera operator
 
 bool photo_operate(ModContext*, CameraOperatorState* state, void*) {
-    if (!g_photo.active)
+    if (!g_photo.active) {
+        // Hand the pristine pose back for a few frames so the game's camera
+        // systems resume from where they were, not from the photo pose.
+        if (g_photo.have_saved && g_photo.restore_frames > 0) {
+            for (int i = 0; i < 3; ++i) {
+                state->eye[i] = g_photo.saved_eye[i];
+                state->center[i] = g_photo.saved_center[i];
+            }
+            if (g_photo.saved_fovy > 1.0f)
+                state->fovy = g_photo.saved_fovy;
+            state->bank_degrees = g_photo.saved_bank;
+            if (--g_photo.restore_frames <= 0)
+                g_photo.have_saved = false;
+            return true;
+        }
         return false;
+    }
     if (!g_photo.seeded) {
         // First frame under our control: adopt the game camera as the starting pose.
         g_photo.eye[0] = state->eye[0];
@@ -421,6 +472,14 @@ bool photo_operate(ModContext*, CameraOperatorState* state, void*) {
         if (state->fovy > 1.0f)
             g_photo.fovy = state->fovy;
         g_photo.seeded = true;
+        // Snapshot the game's pose exactly as it was before we touched it.
+        for (int i = 0; i < 3; ++i) {
+            g_photo.saved_eye[i] = state->eye[i];
+            g_photo.saved_center[i] = state->center[i];
+        }
+        g_photo.saved_fovy = state->fovy;
+        g_photo.saved_bank = state->bank_degrees;
+        g_photo.have_saved = true;
     }
     const float ex = g_photo.eye[0] + g_photo.eye_off[0];
     const float ey = g_photo.eye[1] + g_photo.eye_off[1];
@@ -486,6 +545,99 @@ bool folder_ok() {
            svc_file->check(mod_ctx, g_folder_location) == MOD_OK;
 }
 
+// ---------------------------------------------------------------- background stitch
+//
+// A completed job is stitched inside the mod, on a worker thread, so the
+// player drops straight back into the game instead of running the CLI by
+// hand. The stitcher is pure file IO (std::filesystem + stb + BigTIFF writer)
+// - it touches neither WebGPU nor the mod services - so running it off the
+// game thread is safe; only completion is marshalled back through atomics and
+// consumed (toasts) on the game thread in mod_update.
+//
+// FileService locations are deliberately opaque, but on desktop they are
+// plain paths or file:// URIs; anything exotic (Android grants etc.) falls
+// back to the manual CLI hint.
+bool location_to_path(const char* loc, std::filesystem::path& out) {
+    if (!loc || !*loc)
+        return false;
+    std::string s = loc;
+    const size_t scheme = s.find("://");
+    if (scheme != std::string::npos) {
+        if (s.compare(0, scheme, "file") != 0)
+            return false;
+        s = s.substr(scheme + 3);
+        std::string dec;
+        for (size_t i = 0; i < s.size(); ++i) {
+            if (s[i] == '%' && i + 2 < s.size()) {
+                auto hexv = [](char c) -> int {
+                    if (c >= '0' && c <= '9') return c - '0';
+                    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                    return -1;
+                };
+                const int hi = hexv(s[i + 1]), lo = hexv(s[i + 2]);
+                if (hi >= 0 && lo >= 0) {
+                    dec += static_cast<char>(hi * 16 + lo);
+                    i += 2;
+                    continue;
+                }
+            }
+            dec += s[i];
+        }
+        s = dec;
+        // file:///C:/dir -> /C:/dir: drop the slash before a drive letter.
+        if (s.size() > 2 && s[0] == '/' && s[2] == ':')
+            s.erase(s.begin());
+    }
+    out = std::filesystem::path(s);
+    std::error_code ec;
+    return std::filesystem::is_directory(out, ec);
+}
+
+void start_auto_stitch(uint64_t job_id) {
+    if (!cfg_bool(g_var_auto_stitch, true))
+        return;
+    if (g_stitch_running) {
+        mods::log::info("lumen: auto-stitch skipped for job {}: a stitch is already running",
+            job_id);
+        return;
+    }
+    std::filesystem::path dir;
+    if (!location_to_path(g_folder_location, dir)) {
+        char body[224];
+        std::snprintf(body, sizeof(body),
+            "Job saved. The capture folder isn't a plain path, so stitching stays manual:\n"
+            "lumen stitch lumen-%" PRIu64 ".json", job_id);
+        push_photo_toast("Lumen Photo Mode", body, "info");
+        return;
+    }
+    const auto manifest = dir / ("lumen-" + std::to_string(job_id) + ".json");
+    std::error_code ec;
+    if (!std::filesystem::exists(manifest, ec)) {
+        mods::log::warn("lumen: auto-stitch cannot find {}", manifest.string());
+        return;
+    }
+    g_stitch_running = true;
+    g_stitch_percent = 0;
+    g_stitch_worker = std::thread([manifest, job_id] {
+        lumen::stitch::Options opt;
+        opt.out = manifest;
+        opt.out.replace_extension(".tiff");
+        std::string err;
+        const bool ok = lumen::stitch::run(manifest, opt, err,
+            [](uint32_t p) { g_stitch_percent = p; });
+        std::lock_guard lock(g_stitch_mtx);
+        g_stitch_done = ok ? opt.out.filename().string() : err;
+        g_stitch_done_ok = ok;
+        g_stitch_running = false;
+    });
+    char body[192];
+    std::snprintf(body, sizeof(body),
+        "Stitching lumen-%" PRIu64 " in the background - carry on playing.", job_id);
+    push_photo_toast("Lumen Photo Mode", body, "info");
+    mods::log::info("lumen: auto-stitch started for job {}", job_id);
+}
+
 ModResult begin_capture(const char* name_override, bool for_job) {
     if (g_capture.phase != CAPTURE_NONE)
         return MOD_OK; // one shot at a time
@@ -503,7 +655,7 @@ ModResult begin_capture(const char* name_override, bool for_job) {
 
 ModResult request_capture() {
     if (!g_photo.active) {
-        push_photo_toast("Lumen Photo Mode", "Enter photo mode first (F9).", "warning");
+        push_photo_toast("Lumen Photo Mode", "Enter photo mode first (F1).", "warning");
         return MOD_ERROR;
     }
     if (g_job.active) {
@@ -552,7 +704,7 @@ void fail_capture(const char* why) {
 bool job_startable() {
     if (!g_photo.active || g_job.active || g_capture.phase != CAPTURE_NONE) {
         if (!g_photo.active)
-            push_photo_toast("Lumen Photo Mode", "Enter photo mode first (F9).", "warning");
+            push_photo_toast("Lumen Photo Mode", "Enter photo mode first (F1).", "warning");
         return false;
     }
     if (!folder_ok()) {
@@ -849,22 +1001,21 @@ void record_job_tile() {
     if (wrote) {
         char body[256];
         std::snprintf(body, sizeof(body),
-            "%s done: %zu %s + lumen-%" PRIu64 ".json.\nStitch with: lumen stitch lumen-%" PRIu64
-            ".json",
+            "%s done: %zu %s saved.",
             kind == JobState::CUBE360   ? "360 panorama"
                 : kind == JobState::STEREO ? "Stereo"
                                            : "Gigapixel",
             tiles,
             kind == JobState::CUBE360   ? "faces"
                 : kind == JobState::STEREO ? "views"
-                                           : "tiles",
-            id, id);
+                                           : "tiles");
         push_photo_toast("Lumen Photo Mode", body);
         mods::log::info("lumen: {} job {} complete ({} parts)",
             kind == JobState::CUBE360   ? "360"
                 : kind == JobState::STEREO ? "stereo"
                                            : "gigapixel",
             id, tiles);
+        start_auto_stitch(id);
     } else {
         push_photo_toast("Lumen Photo Mode",
             kind == JobState::CUBE360   ? "360 faces saved but the manifest could not be written."
@@ -902,8 +1053,8 @@ void enter_photo_mode() {
 
     push_photo_toast("Lumen Photo Mode",
         g_photo.frozen
-            ? "Photo mode on - time frozen. WASD to fly, F10 capture, F11 gigapixel."
-            : "Photo mode on (time freeze unavailable). F10 capture, F11 gigapixel.");
+            ? "Photo mode on - time frozen. WASD to fly, F7 capture, F12 gigapixel."
+            : "Photo mode on (time freeze unavailable). F7 capture, F12 gigapixel.");
     mods::log::info("lumen: photo mode on (frozen={})", g_photo.frozen);
 }
 
@@ -914,10 +1065,11 @@ void exit_photo_mode() {
         abort_job(false);
     g_photo.active = false;
     g_photo.frozen = false;
-    if (g_operator) {
-        svc_camera->unregister_camera_operator(mod_ctx, g_operator);
-        g_operator = 0;
-    }
+    // Keep the operator registered a little longer: it spends the next few
+    // frames writing the game's original pose back (photo_operate's restore
+    // branch), and mod_update unregisters it once that handoff is done.
+    g_photo.restore_frames = g_photo.have_saved ? 8 : 0;
+    g_photo.seeded = false;
     if (g_capture.phase != CAPTURE_NONE) {
         reset_capture_buffers();
         g_capture.phase = CAPTURE_NONE;
@@ -933,40 +1085,43 @@ bool key_held(int vk) {
     return (GetAsyncKeyState(vk) & 0x8000) != 0;
 }
 
-bool g_prev_f8 = false;
-bool g_prev_f9 = false;
-bool g_prev_f10 = false;
-bool g_prev_f11 = false;
+// Hotkey map vs the game's own F-keys (dusk::hotkeys): F2-F6 and F8-F11 are
+// taken (process mgmt, debug overlays, save editor, state share, debug
+// camera, audio debug, TOGGLE FULLSCREEN). Hijacking them caused "windowed
+// mode + stuck zoomed camera": F11 flipped the game's fullscreen setting and
+// F9 turned on the game's debug camera under us. Lumen uses only free keys:
+//   F1 photo mode, F7 capture, F12 gigapixel,
+//   Shift+F7 stereo trio, Shift+F12 360 panorama.
+bool g_prev_f1 = false;
+bool g_prev_f7 = false;
 bool g_prev_f12 = false;
 
 void poll_hotkeys() {
-    const bool f8 = key_held(VK_F8);
-    if (f8 && !g_prev_f8)
-        start_stereo();
-    g_prev_f8 = f8;
-
-    const bool f9 = key_held(VK_F9);
-    if (f9 && !g_prev_f9) {
+    const bool f1 = key_held(VK_F1);
+    if (f1 && !g_prev_f1) {
         if (g_photo.active)
             exit_photo_mode();
         else
             enter_photo_mode();
     }
-    g_prev_f9 = f9;
+    g_prev_f1 = f1;
 
-    const bool f10 = key_held(VK_F10);
-    if (f10 && !g_prev_f10)
-        request_capture();
-    g_prev_f10 = f10;
-
-    const bool f11 = key_held(VK_F11);
-    if (f11 && !g_prev_f11)
-        start_gigapixel();
-    g_prev_f11 = f11;
+    const bool f7 = key_held(VK_F7);
+    if (f7 && !g_prev_f7) {
+        if (key_held(VK_SHIFT))
+            start_stereo();
+        else
+            request_capture();
+    }
+    g_prev_f7 = f7;
 
     const bool f12 = key_held(VK_F12);
-    if (f12 && !g_prev_f12)
-        start_360();
+    if (f12 && !g_prev_f12) {
+        if (key_held(VK_SHIFT))
+            start_360();
+        else
+            start_gigapixel();
+    }
     g_prev_f12 = f12;
 }
 
@@ -1551,6 +1706,17 @@ ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
         svc_ui->pane_add_control(mod_ctx, panel, &ctl, nullptr);
     }
 
+    {
+        UiControlDesc ctl = UI_CONTROL_DESC_INIT;
+        ctl.kind = UI_CONTROL_TOGGLE;
+        ctl.label = "Auto-stitch finished jobs";
+        ctl.help_rml = "Composites gigapixel / 360 / stereo jobs into a tiled BigTIFF "
+                       "on a background thread as soon as the last part is saved.";
+        ctl.binding = UI_BINDING_CONFIG_VAR;
+        ctl.config_var = g_var_auto_stitch;
+        svc_ui->pane_add_control(mod_ctx, panel, &ctl, nullptr);
+    }
+
     return MOD_OK;
 }
 
@@ -1581,6 +1747,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     g_var_strip_bloom = register_var_typed("stripBloom", CONFIG_VAR_BOOL, 1, 0);
     g_var_strip_fade = register_var_typed("stripFade", CONFIG_VAR_BOOL, 1, 0);
     g_var_strip_blur = register_var_typed("stripBlur", CONFIG_VAR_BOOL, 1, 0);
+    g_var_auto_stitch = register_var_typed("autoStitch", CONFIG_VAR_BOOL, 1, 0);
     g_pins[0].toggle = g_var_strip_blur;
     g_pins[1].toggle = g_var_strip_fade;
     g_pins[2].toggle = g_var_strip_bloom;
@@ -1668,6 +1835,39 @@ MOD_EXPORT ModResult mod_update(ModError* error) {
         dt = 0.1f;
     apply_flight_input(dt);
 
+    // Deferred camera handoff: exit_photo_mode keeps the operator registered
+    // until the saved game pose has been written back (photo_operate clears
+    // have_saved when the restore window ends); unregister here, on the game
+    // thread, not from inside the camera callback.
+    if (g_operator && !g_photo.active && !g_photo.have_saved) {
+        svc_camera->unregister_camera_operator(mod_ctx, g_operator);
+        g_operator = 0;
+    }
+
+    // Background-stitch completions (worker thread -> game thread).
+    if (!g_stitch_running) {
+        std::string done;
+        bool ok = false;
+        {
+            std::lock_guard lock(g_stitch_mtx);
+            if (!g_stitch_done.empty()) {
+                done.swap(g_stitch_done);
+                ok = g_stitch_done_ok;
+            }
+        }
+        if (!done.empty()) {
+            if (ok) {
+                char body[256];
+                std::snprintf(body, sizeof(body), "Stitched: %s", done.c_str());
+                push_photo_toast("Lumen Photo Mode", body);
+                mods::log::info("lumen: auto-stitch finished -> {}", done);
+            } else {
+                push_photo_toast("Lumen Photo Mode", done.c_str(), "error");
+                mods::log::warn("lumen: auto-stitch failed: {}", done);
+            }
+        }
+    }
+
     // Stall watchdog: a capture whose map never completes (lost device,
     // wedged queue) must not pin photo mode or a job forever. Generous at
     // any plausible frame rate; PNG encode is synchronous and far faster.
@@ -1719,6 +1919,10 @@ MOD_EXPORT ModResult mod_shutdown(ModError* error) {
         svc_camera->unregister_camera_operator(mod_ctx, g_operator);
         g_operator = 0;
     }
+    // The stitch worker runs code from this module: an unload/reload while it
+    // is stitching would unmap running code. Wait for it to finish.
+    if (g_stitch_worker.joinable())
+        g_stitch_worker.join();
     if (g_hook_scene_begin) {
         svc_gfx->unregister_stage_hook(mod_ctx, g_hook_scene_begin);
         g_hook_scene_begin = 0;

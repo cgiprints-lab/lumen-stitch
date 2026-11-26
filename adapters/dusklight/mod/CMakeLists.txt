@@ -24,6 +24,16 @@ add_mod(lumen_photo
         FEATURES fmt game webgpu
         SOURCES
             src/mod.cpp
+            ../../../stitcher/src/stitch.cpp
+            ../../../stitcher/src/bigtiff.cpp
+            ../../../core/src/json.cpp
         MOD_JSON "${CMAKE_CURRENT_BINARY_DIR}/mod.json"
 )
-target_include_directories(lumen_photo PRIVATE third_party "${CMAKE_CURRENT_SOURCE_DIR}/../../..")
+# The stitcher is compiled in so completed jobs auto-stitch in the background.
+# stitch.h includes "tilemath.h" bare, and stitch.cpp includes the json + stb
+# headers the same way the standalone stitcher build resolves them.
+target_include_directories(lumen_photo PRIVATE third_party "${CMAKE_CURRENT_SOURCE_DIR}/../../.."
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../stitcher/src"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../stitcher/third_party"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../common"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../core/src")
