@@ -3,10 +3,13 @@
 //   lumen status
 //   lumen install --adapter <id> [--artifact <path> | --build] [--all]
 //   lumen uninstall --adapter <id> [--all]
+//   lumen stitch <manifest.json> [--out <file.tiff>] [--preview-max N]
+//                [--min-mip N] [--preview-png] [--no-preview]
 #include "adapter.h"
 #include "detect.h"
 #include "state.h"
 #include "util.h"
+#include "stitch.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -196,11 +199,56 @@ int cmd_uninstall(const Adapter& a, int argc, char** argv) {
     return done ? 0 : 2;
 }
 
+int cmd_stitch(int argc, char** argv) {
+    stitch::Options opt;
+    std::filesystem::path manifest;
+    for (int i = 2; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--out" && i + 1 < argc)
+            opt.out = argv[++i];
+        else if (a == "--preview-max" && i + 1 < argc)
+            opt.preview_max = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+        else if (a == "--min-mip" && i + 1 < argc)
+            opt.min_mip_edge = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+        else if (a == "--no-preview")
+            opt.preview_jpeg = opt.preview_png = false;
+        else if (a == "--preview-png")
+            opt.preview_png = true;
+        else if (!a.empty() && a[0] != '-' && manifest.empty())
+            manifest = a;
+    }
+    if (manifest.empty()) {
+        std::cerr << "usage: lumen stitch <manifest.json> [--out <file.tiff>] "
+                     "[--preview-max N] [--min-mip N] [--preview-png] [--no-preview]\n";
+        return 1;
+    }
+    uint32_t last_pct = 0;
+    auto progress = [](uint32_t pct) {
+        std::printf("\rcompositing %3u%%", pct);
+        std::fflush(stdout);
+    };
+    std::string err;
+    if (!stitch::run(manifest, opt, err, progress)) {
+        std::printf("\n");
+        std::cerr << "stitch failed: " << err << "\n";
+        return 1;
+    }
+    std::printf("\n");
+    auto out = opt.out.empty() ? std::filesystem::path(manifest).replace_extension(".tiff")
+                               : opt.out;
+    std::cout << "wrote " << out.string() << "\n";
+    (void)last_pct;
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     std::string command = argc > 1 ? argv[1] : "status";
     std::filesystem::path adir = adapters_dir(argc, argv);
+
+    if (command == "stitch")
+        return cmd_stitch(argc, argv);
 
     if (command == "status" || command == "install" || command == "uninstall") {
         auto adapters = select_adapters(argc, argv, adir);
@@ -220,7 +268,7 @@ int main(int argc, char** argv) {
     }
 
     std::cout <<
-        "usage: lumen <status|install|uninstall> [--adapter <id>] "
+        "usage: lumen <status|install|uninstall|stitch> [--adapter <id>] "
         "[--artifact <path>|--build] [--all] [--adapters <dir>]\n";
     return command == "help" ? 0 : 1;
 }

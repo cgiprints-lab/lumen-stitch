@@ -35,6 +35,10 @@ cmake --build build/dusklight-mod          # produces build/dusklight-mod/mods/l
 build/core/lumen status
 build/core/lumen install --adapter dusklight --artifact build/dusklight-mod/mods/lumen_photo.dusk
 build/core/lumen uninstall --adapter dusklight
+
+# stitch a gigapixel job captured in-game (F9 photo mode, F11 gigapixel):
+# tiles + manifest land in the capture folder; stitch offline:
+build/core/lumen stitch "path/to/capture-folder/lumen-<id>.json" --out panorama.tiff
 ```
 
 Dusklight mod dirs used by the installer:
@@ -52,9 +56,15 @@ restart.
 
 - **M0** (done): manager CLI (status/install/uninstall), adapter manifest, mod
   skeleton (in-game mod panel, session toggle toast, settings persistence).
-- **M1**: time freeze, free camera (camera operator), HUD-free 1x capture.
-- **M2**: gigapixel tiled capture (2x-33x, projection-offset tiles) + BigTIFF
-  stitcher.
+- **M1** (done): time freeze, free camera (camera operator), HUD-free 1x
+  capture (F9/F10, WASD/QE flight).
+- **M2** (done, pending in-game run with a CI artifact): gigapixel capture —
+  F11 renders an S×S grid of projection-offset sub-frustums at one frozen eye
+  (2–33 tiles per side), tiles stream to the capture folder with a JSON
+  manifest; `lumen stitch` composites them strip-by-strip into a tiled
+  BigTIFF with a SubIFD mip chain plus JPEG/PNG previews. Shared tile math
+  (`common/tilemath.h`) is exercised by `stitcher/test/seam_test.cpp`
+  (FOV=90 seam fidelity vs a reference render, BigTIFF structure).
 - **M3**: effect overrides (vignette/temporal/LOD), EXR/HDR.
 - **M4**: 360/stereo capture, per-platform artifacts, version fallback matrix.
 - **M5**: adapter contract v1, second game adapter.

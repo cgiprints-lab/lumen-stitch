@@ -1,12 +1,14 @@
 // Lumen Photo Mode - Dusklight integration (Ansel-style photography for Dusklight).
 //
-// M1 scope: photo sessions with a free camera (CameraService operator), time freeze
+// M2 scope: photo sessions with a free camera (CameraService operator), time freeze
 // (HookService post-hook on dusk::game_clock::advance zeroing numSimTicks), HUD-free
-// native-resolution PNG capture (GfxService resolve_pass at FRAME_BEFORE_HUD + WebGPU
-// compute readback), hotkeys, and capture folder persistence.
+// native-resolution capture (GfxService resolve_pass at FRAME_BEFORE_HUD + WebGPU
+// compute readback), hotkeys, capture folder persistence, and gigapixel capture:
+// an S x S grid of sub-frustum re-projections sharing one eye (Ansel's gigapixel
+// model), each tile written as a PNG plus a JSON manifest for `lumen stitch`.
 //
 // Controls (Windows; panel buttons cover every action on other platforms):
-//   F9  enter / exit photo mode      F10 capture (1x)
+//   F9  enter / exit photo mode   F10 capture (1x)   F11 gigapixel job
 //   WASD move, Q/E down/up, arrows look, Shift boost, PgUp/PgDn field of view.
 #include "mods/api.h"
 
@@ -41,7 +43,12 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
+
+#include "common/tilemath.h"
+
+namespace tilemath = lumen::tilemath;
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -99,6 +106,7 @@ struct PhotoState {
     float yaw = 0;   // radians
     float pitch = 0; // radians
     float fovy = 90; // degrees
+    float fov_override = 0; // per-tile FOV during a gigapixel job (0 = none)
 };
 PhotoState g_photo;
 
@@ -107,6 +115,8 @@ struct CaptureState {
     int settle_left = 0;
     uint32_t width = 0;
     uint32_t height = 0;
+    bool for_job = false;          // this capture is a gigapixel tile
+    std::vector<char> name;        // file name override (utf-8), else timestamped
     // Mod-owned per-capture readback objects.
     WGPUBuffer staging = nullptr;  // MAP_READ | COPY_DST
     WGPUBuffer storage = nullptr;  // STORAGE | COPY_SRC (compute output)
@@ -115,6 +125,30 @@ struct CaptureState {
     WGPUComputePipeline pipeline = nullptr;
 };
 CaptureState g_capture;
+
+// --- gigapixel job ----------------------------------------------------------
+// One job = an S x S grid of tiles re-projecting sub-frusta of the master
+// camera (same eye). Tiles aim through the existing camera operator; each
+// tile is one capture at native size. The manifest written at the end carries
+// per-tile pose so the external stitcher can resample exactly.
+struct JobTileDef {
+    int row = 0, col = 0;
+    double yaw = 0, pitch = 0; // radians (pose applied to the operator)
+    double fovy = 90;          // degrees
+    uint32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0; // master-pixel rect owned
+    std::vector<char> name;    // utf-8 tile PNG name
+};
+struct JobState {
+    bool active = false;
+    bool build_pending = false; // waiting on the viewport-size probe
+    uint32_t S = 0;             // tiles per side, frozen at job start
+    uint32_t vw = 0, vh = 0;    // scene color size (probe)
+    uint64_t id = 0;            // timestamp shared by tile names + manifest
+    std::vector<JobTileDef> tiles;
+    size_t idx = 0;
+    std::string json; // manifest text, tiles appended as each one completes
+};
+JobState g_job;
 
 // Latest world camera, refreshed at GFX_STAGE_SCENE_BEGIN (world-camera stage).
 CameraInfo g_camera = CAMERA_INFO_INIT;
@@ -171,6 +205,14 @@ void cfg_string(ConfigVarHandle var, char* buffer, size_t size) {
 UiElementHandle g_status_text = 0;
 
 const char* status_label() {
+    static char buf[128];
+    if (g_job.active) {
+        if (g_job.build_pending)
+            return "gigapixel: measuring viewport...";
+        std::snprintf(buf, sizeof(buf), "gigapixel: tile %zu/%zu", g_job.idx + 1,
+            g_job.tiles.size());
+        return buf;
+    }
     if (!g_photo.active)
         return "photo mode: off (F9)";
     return g_photo.frozen ? "photo mode: ON, time frozen"
@@ -213,7 +255,7 @@ bool photo_operate(ModContext*, CameraOperatorState* state, void*) {
     state->center[0] = g_photo.eye[0] + cp * std::sinf(g_photo.yaw);
     state->center[1] = g_photo.eye[1] + std::sinf(g_photo.pitch);
     state->center[2] = g_photo.eye[2] + cp * std::cosf(g_photo.yaw);
-    state->fovy = g_photo.fovy;
+    state->fovy = g_photo.fov_override > 0.0f ? g_photo.fov_override : g_photo.fovy;
     state->bank_degrees = 0;
     return true;
 }
@@ -242,16 +284,193 @@ bool folder_ok() {
            svc_file->check(mod_ctx, g_folder_location) == MOD_OK;
 }
 
+ModResult begin_capture(const char* name_override, bool for_job) {
+    if (g_capture.phase != CAPTURE_NONE)
+        return MOD_OK; // one shot at a time
+    g_capture.settle_left = static_cast<int>(cfg_int(g_var_settle_frames, 2));
+    g_capture.for_job = for_job;
+    g_capture.name.clear();
+    if (name_override) {
+        const size_t n = std::strlen(name_override);
+        g_capture.name.assign(name_override, name_override + n + 1);
+    }
+    g_capture.phase = CAPTURE_WAIT_SETTLE;
+    return MOD_OK;
+}
+
 ModResult request_capture() {
     if (!g_photo.active) {
         push_photo_toast("Lumen Photo Mode", "Enter photo mode first (F9).", "warning");
         return MOD_ERROR;
     }
-    if (g_capture.phase != CAPTURE_NONE)
-        return MOD_OK; // one shot at a time in M1
-    g_capture.settle_left = static_cast<int>(cfg_int(g_var_settle_frames, 2));
-    g_capture.phase = CAPTURE_WAIT_SETTLE;
-    return MOD_OK;
+    if (g_job.active) {
+        push_photo_toast("Lumen Photo Mode", "A gigapixel job is running.", "warning");
+        return MOD_OK;
+    }
+    return begin_capture(nullptr, false);
+}
+
+// ---------------------------------------------------------------- gigapixel job
+
+void abort_job(bool notify) {
+    if (!g_job.active)
+        return;
+    g_job.active = false;
+    g_job.tiles.clear();
+    g_job.idx = 0;
+    g_job.json.clear();
+    g_photo.fov_override = 0;
+    if (g_capture.phase != CAPTURE_NONE) {
+        reset_capture_buffers();
+        g_capture.phase = CAPTURE_NONE;
+    }
+    if (notify)
+        push_photo_toast("Lumen Photo Mode", "Gigapixel job canceled.", "warning");
+}
+
+void start_gigapixel() {
+    if (!g_photo.active || g_job.active || g_capture.phase != CAPTURE_NONE) {
+        if (!g_photo.active)
+            push_photo_toast("Lumen Photo Mode", "Enter photo mode first (F9).", "warning");
+        return;
+    }
+    if (!folder_ok()) {
+        push_photo_toast("Lumen Photo Mode", "Set a capture folder in the Lumen panel first.",
+            "warning");
+        return;
+    }
+    const int64_t S = cfg_int(g_var_capture_scale, 4);
+    if (S < 1)
+        return;
+    if (S > 33) {
+        push_photo_toast("Lumen Photo Mode",
+            "Tiles-per-side above 33 exceeds the supported maximum.", "warning");
+        return;
+    }
+    if (S > 16) {
+        push_photo_toast("Lumen Photo Mode",
+            "Over 16x uses the opt-in high-cost path: thousands of frames.", "info");
+    }
+    g_job.active = true;
+    g_job.build_pending = true; // need the scene color size before aiming tiles
+    g_job.S = static_cast<uint32_t>(S);
+    g_job.tiles.clear();
+    g_job.idx = 0;
+    g_job.json.clear();
+    g_job.id = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+    mods::log::info("lumen: gigapixel job {} started ({}x{} tiles)", g_job.id, S, S);
+}
+
+// Build the tile grid once the scene color size is known (probe frame).
+void build_job_tiles(uint32_t vw, uint32_t vh) {
+    const uint32_t S = g_job.S;
+    if (!S) {
+        abort_job(true);
+        return;
+    }
+    tilemath::Master m;
+    m.yaw = g_photo.yaw;
+    m.pitch = g_photo.pitch;
+    m.fovy = g_photo.fovy;
+    m.vw = vw;
+    m.vh = vh;
+    m.width = vw * S;
+    m.height = vh * S;
+    g_job.vw = vw;
+    g_job.vh = vh;
+    char name[160];
+    for (uint32_t r = 0; r < S; ++r) {
+        for (uint32_t c = 0; c < S; ++c) {
+            const uint32_t x0 = c * vw, y0 = r * vh;
+            const uint32_t x1 = x0 + vw, y1 = y0 + vh;
+            const tilemath::Tile t = tilemath::make_tile(m, x0, y0, x1, y1,
+                static_cast<int>(r), static_cast<int>(c));
+            JobTileDef def;
+            def.row = static_cast<int>(r);
+            def.col = static_cast<int>(c);
+            def.yaw = t.yaw;
+            def.pitch = t.pitch;
+            def.fovy = t.fovy;
+            def.x0 = x0;
+            def.y0 = y0;
+            def.x1 = x1;
+            def.y1 = y1;
+            std::snprintf(name, sizeof(name), "lumen-%" PRIu64 "-r%u-c%u.png", g_job.id, r, c);
+            def.name.assign(name, name + std::strlen(name) + 1);
+            g_job.tiles.push_back(std::move(def));
+        }
+    }
+    char head[320];
+    std::snprintf(head, sizeof(head),
+        "{\"lumenJob\":1,\"scale\":%" PRIu32 ",\"master\":{\"yaw\":%.9g,\"pitch\":%.9g,"
+        "\"fovy\":%.9g,\"vw\":%" PRIu32 ",\"vh\":%" PRIu32 ",\"width\":%" PRIu32
+        ",\"height\":%" PRIu32 "},\"tiles\":[",
+        S, m.yaw, m.pitch, m.fovy, vw, vh, m.width, m.height);
+    g_job.json = head;
+    g_job.build_pending = false;
+}
+
+// Apply the next tile's pose and start its capture. The eye never moves
+// during a job (all tiles share the master eye - pure rotation).
+void advance_job() {
+    if (g_job.idx >= g_job.tiles.size())
+        return;
+    const JobTileDef& t = g_job.tiles[g_job.idx];
+    g_photo.yaw = static_cast<float>(t.yaw);
+    g_photo.pitch = static_cast<float>(t.pitch);
+    g_photo.fov_override = static_cast<float>(t.fovy);
+    begin_capture(t.name.data(), true);
+}
+
+// Manifest entry for the tile that just completed.
+void record_job_tile() {
+    const JobTileDef& t = g_job.tiles[g_job.idx];
+    char entry[320];
+    std::snprintf(entry, sizeof(entry),
+        "%s{\"file\":\"%s\",\"row\":%d,\"col\":%d,\"yaw\":%.9g,\"pitch\":%.9g,"
+        "\"fovy\":%.9g,\"width\":%" PRIu32 ",\"height\":%" PRIu32 ",\"rect\":[%" PRIu32
+        ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 "]}",
+        g_job.idx ? "," : "", t.name.data(), t.row, t.col, t.yaw, t.pitch, t.fovy, g_capture.width,
+        g_capture.height, t.x0, t.y0, t.x1, t.y1);
+    g_job.json += entry;
+    ++g_job.idx;
+    if (g_job.idx < g_job.tiles.size())
+        return;
+
+    // Job complete: write the manifest and hand off to the stitcher CLI.
+    g_job.json += "]}";
+    char manifest_name[160];
+    std::snprintf(manifest_name, sizeof(manifest_name), "lumen-%" PRIu64 ".json", g_job.id);
+    const char* child = nullptr;
+    bool wrote = false;
+    if (svc_file->create_child(mod_ctx, g_folder_location, manifest_name, &child) == MOD_OK &&
+        child) {
+        char child_copy[1024];
+        std::snprintf(child_copy, sizeof(child_copy), "%s", child);
+        wrote = svc_file->write_all(mod_ctx, child_copy, g_job.json.data(), g_job.json.size()) ==
+                MOD_OK;
+    }
+    const uint64_t id = g_job.id;
+    const size_t tiles = g_job.tiles.size();
+    g_job.active = false;
+    g_job.tiles.clear();
+    g_job.json.clear();
+    g_photo.fov_override = 0;
+    if (wrote) {
+        char body[256];
+        std::snprintf(body, sizeof(body),
+            "Gigapixel done: %zu tiles + lumen-%" PRIu64
+            ".json.\nStitch with: lumen stitch lumen-%" PRIu64 ".json",
+            tiles, id, id);
+        push_photo_toast("Lumen Photo Mode", body);
+        mods::log::info("lumen: gigapixel job {} complete ({} tiles)", id, tiles);
+    } else {
+        push_photo_toast("Lumen Photo Mode",
+            "Gigapixel tiles saved but the manifest could not be written.", "error");
+    }
 }
 
 void enter_photo_mode() {
@@ -275,14 +494,17 @@ void enter_photo_mode() {
     g_photo.frozen = GameClockAdvance::g_orig != nullptr;
 
     push_photo_toast("Lumen Photo Mode",
-        g_photo.frozen ? "Photo mode on - time frozen. WASD to fly, F10 to capture."
-                       : "Photo mode on (time freeze unavailable). F10 to capture.");
+        g_photo.frozen
+            ? "Photo mode on - time frozen. WASD to fly, F10 capture, F11 gigapixel."
+            : "Photo mode on (time freeze unavailable). F10 capture, F11 gigapixel.");
     mods::log::info("lumen: photo mode on (frozen={})", g_photo.frozen);
 }
 
 void exit_photo_mode() {
     if (!g_photo.active)
         return;
+    if (g_job.active)
+        abort_job(false);
     g_photo.active = false;
     g_photo.frozen = false;
     if (g_operator) {
@@ -306,6 +528,7 @@ bool key_held(int vk) {
 
 bool g_prev_f9 = false;
 bool g_prev_f10 = false;
+bool g_prev_f11 = false;
 
 void poll_hotkeys() {
     const bool f9 = key_held(VK_F9);
@@ -321,11 +544,21 @@ void poll_hotkeys() {
     if (f10 && !g_prev_f10)
         request_capture();
     g_prev_f10 = f10;
+
+    const bool f11 = key_held(VK_F11);
+    if (f11 && !g_prev_f11)
+        start_gigapixel();
+    g_prev_f11 = f11;
 }
 
 void apply_flight_input(float dt) {
     if (!g_photo.active)
         return;
+    if (g_job.active) {
+        // Tiles must share one eye and one master frustum: no piloting while
+        // a gigapixel job drives the camera.
+        return;
+    }
     float speed = static_cast<float>(cfg_float(g_var_move_speed, 20.0));
     if (key_held(VK_SHIFT))
         speed *= 4.0f;
@@ -536,11 +769,17 @@ void png_write_cb(void* context, void* data, int size) {
 
 void finish_capture_file() {
     const uint64_t bytes = static_cast<uint64_t>(g_capture.width) * g_capture.height * 4ull;
+    const bool for_job = g_capture.for_job;
+    std::vector<char> name = g_capture.name;
+    g_capture.name.clear();
+    g_capture.for_job = false;
     const void* mapped = wgpuBufferGetConstMappedRange(g_capture.staging, 0, bytes);
     if (!mapped) {
         reset_capture_buffers();
         g_capture.phase = CAPTURE_NONE;
         push_photo_toast("Lumen Photo Mode", "Capture failed: readback unavailable.", "error");
+        if (for_job)
+            abort_job(true);
         return;
     }
     std::vector<uint8_t> png;
@@ -548,31 +787,46 @@ void finish_capture_file() {
         static_cast<int>(g_capture.height), 4, mapped, static_cast<int>(g_capture.width * 4));
     reset_capture_buffers();
     g_capture.phase = CAPTURE_NONE;
+    auto fail = [&](const char* why) {
+        push_photo_toast("Lumen Photo Mode", why, "error");
+        if (for_job)
+            abort_job(true);
+    };
     if (!ok || png.empty()) {
-        push_photo_toast("Lumen Photo Mode", "Capture failed: PNG encode error.", "error");
+        fail("Capture failed: PNG encode error.");
         return;
+    }
+    if (name.empty()) {
+        const long long now = static_cast<long long>(
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count());
+        char default_name[128];
+        std::snprintf(default_name, sizeof(default_name), "lumen-%lld-%ux%u.png", now,
+            g_capture.width, g_capture.height);
+        name.assign(default_name, default_name + std::strlen(default_name) + 1);
     }
     if (!folder_ok()) {
         push_photo_toast("Lumen Photo Mode", "Set a capture folder in the Lumen panel first.",
             "warning");
+        if (for_job)
+            abort_job(true);
         return;
     }
-    const long long now = static_cast<long long>(
-        std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch())
-            .count());
-    char name[128];
-    std::snprintf(name, sizeof(name), "lumen-%lld-%ux%u.png", now, g_capture.width,
-        g_capture.height);
     const char* child = nullptr;
-    if (svc_file->create_child(mod_ctx, g_folder_location, name, &child) != MOD_OK || !child) {
-        push_photo_toast("Lumen Photo Mode", "Capture failed: could not create file.", "error");
+    if (svc_file->create_child(mod_ctx, g_folder_location, name.data(), &child) != MOD_OK ||
+        !child) {
+        fail("Capture failed: could not create file.");
         return;
     }
     char child_copy[1024];
     std::snprintf(child_copy, sizeof(child_copy), "%s", child);
     if (svc_file->write_all(mod_ctx, child_copy, png.data(), png.size()) != MOD_OK) {
-        push_photo_toast("Lumen Photo Mode", "Capture failed: write error.", "error");
+        fail("Capture failed: write error.");
+        return;
+    }
+    if (for_job) {
+        record_job_tile();
         return;
     }
     mods::log::info("lumen: saved {}x{} capture ({} byte PNG)", g_capture.width, g_capture.height,
@@ -590,6 +844,19 @@ void on_scene_begin(ModContext*, const GfxStageContext* stage, void*) {
 }
 
 void on_frame_before_hud(ModContext*, const GfxStageContext*, void*) {
+    // Gigapixel job kickoff: one probe of the scene color size before aiming
+    // tiles (the master grid is defined in viewport-sized cells).
+    if (g_job.active && g_job.build_pending) {
+        GfxResolveDesc resolveDesc = GFX_RESOLVE_DESC_INIT;
+        resolveDesc.color = true;
+        GfxResolvedTargets targets = GFX_RESOLVED_TARGETS_INIT;
+        if (svc_gfx->resolve_pass(mod_ctx, &resolveDesc, &targets) == MOD_OK && targets.width &&
+            targets.height) {
+            // Views from resolve_pass are borrowed for this callback only.
+            build_job_tiles(targets.width, targets.height);
+        }
+        return;
+    }
     if (g_capture.phase != CAPTURE_WAIT_SETTLE || g_capture.settle_left > 0)
         return;
     GfxDeviceInfo info = GFX_DEVICE_INFO_INIT;
@@ -622,6 +889,10 @@ void on_toggle_pressed(ModContext*, void*) {
 
 void on_capture_pressed(ModContext*, void*) {
     request_capture();
+}
+
+void on_gigapixel_pressed(ModContext*, void*) {
+    start_gigapixel();
 }
 
 void on_folder_picked(ModContext*, ModResult status, const char* const* locations, uint32_t count,
@@ -663,6 +934,14 @@ ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
     capture.on_pressed = on_capture_pressed;
     svc_ui->pane_add_control(mod_ctx, panel, &capture, nullptr);
 
+    UiControlDesc gigapixel = UI_CONTROL_DESC_INIT;
+    gigapixel.kind = UI_CONTROL_BUTTON;
+    gigapixel.label = "Capture gigapixel (multi-tile)";
+    gigapixel.help_rml = "Renders the scene many times at the same eye, one tile per "
+                         "sub-frustum, then stitch offline: lumen stitch <manifest.json>.";
+    gigapixel.on_pressed = on_gigapixel_pressed;
+    svc_ui->pane_add_control(mod_ctx, panel, &gigapixel, nullptr);
+
     UiControlDesc folder = UI_CONTROL_DESC_INIT;
     folder.kind = UI_CONTROL_BUTTON;
     folder.label = "Choose capture folder...";
@@ -673,8 +952,10 @@ ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
 
     UiControlDesc scale = UI_CONTROL_DESC_INIT;
     scale.kind = UI_CONTROL_NUMBER;
-    scale.label = "Super resolution scale";
-    scale.help_rml = "Gigapixel capture multiplier (2-33). Used by the M2 pipeline.";
+    scale.label = "Gigapixel tiles per side";
+    scale.help_rml = "Super resolution multiplier (2-33). Final image is this many times "
+                     "the window resolution in each direction; above 16 is the opt-in "
+                     "slow path.";
     scale.binding = UI_BINDING_CONFIG_VAR;
     scale.config_var = g_var_capture_scale;
     scale.min = 2;
@@ -776,7 +1057,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         return MOD_ERROR;
     }
 
-    mods::log::info("Lumen Photo Mode {} loaded (M1)", "0.1.0");
+    mods::log::info("Lumen Photo Mode {} loaded (M2: photo + freeze + gigapixel)", "0.1.0");
     return MOD_OK;
 }
 
@@ -805,10 +1086,17 @@ MOD_EXPORT ModResult mod_update(ModError* error) {
         wgpuBufferGetMapState(g_capture.staging) == WGPUBufferMapState_Mapped) {
         finish_capture_file();
     }
+    // Drive the gigapixel job: start the next tile once the previous one is
+    // fully written.
+    if (g_job.active && !g_job.build_pending && g_capture.phase == CAPTURE_NONE &&
+        g_job.idx < g_job.tiles.size()) {
+        advance_job();
+    }
     return MOD_OK;
 }
 
 MOD_EXPORT ModResult mod_shutdown(ModError* error) {
+    abort_job(false);
     g_photo.active = false;
     g_photo.frozen = false;
     if (g_operator) {

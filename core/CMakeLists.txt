@@ -10,7 +10,15 @@ add_executable(lumen
         src/util.cpp
         src/adapter.cpp
         src/detect.cpp
-        src/state.cpp)
+        src/state.cpp
+        ../stitcher/src/stitch.cpp
+        ../stitcher/src/bigtiff.cpp)
+
+target_include_directories(lumen PRIVATE
+        src
+        ../common
+        ../stitcher/src
+        ../stitcher/third_party)
 
 if (MSVC)
     target_compile_options(lumen PRIVATE /W4 /permissive-)

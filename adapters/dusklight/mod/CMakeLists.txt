@@ -26,4 +26,4 @@ add_mod(lumen_photo
             src/mod.cpp
         MOD_JSON "${CMAKE_CURRENT_BINARY_DIR}/mod.json"
 )
-target_include_directories(lumen_photo PRIVATE third_party)
+target_include_directories(lumen_photo PRIVATE third_party "${CMAKE_CURRENT_SOURCE_DIR}/../../..")
