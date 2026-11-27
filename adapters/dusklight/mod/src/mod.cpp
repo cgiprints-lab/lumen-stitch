@@ -1447,6 +1447,12 @@ void on_readback_compute(ModContext*, const GfxComputeContext* compute, const vo
         wgpuComputePassEncoderDispatchWorkgroups(pass, (p.width + 7u) / 8u, (p.height + 7u) / 8u, 1);
         wgpuComputePassEncoderEnd(pass);
         wgpuComputePassEncoderRelease(pass);
+        static int s_dispatch_logged = 0;
+        if (s_dispatch_logged < 4) {
+            ++s_dispatch_logged;
+            mods::log::info("lumen: readback dispatched inside frame encoder ({}x{})",
+                p.width, p.height);
+        }
     }
     wgpuCommandEncoderCopyBufferToBuffer(compute->encoder, p.storage, 0, p.staging, 0, p.bytes);
     wgpuBindGroupRelease(bindGroup);
@@ -1539,6 +1545,8 @@ void issue_capture(WGPUDevice device) {
         fail_capture("Capture failed: compute task rejected.");
         return;
     }
+    mods::log::info("lumen: capture issued {} ({}x{}, job={})", g_capture.name.data(), w, h,
+        g_capture.for_job ? 1 : 0);
     g_capture.width = w;
     g_capture.height = h;
     g_capture.phase = CAPTURE_WAIT_COPY;
@@ -1627,12 +1635,32 @@ void finish_capture_file() {
 
 // ---------------------------------------------------------------- gfx stage hooks
 
+// The game calls stage hooks and the camera operator WITHOUT a try/catch
+// (unlike mod_update, which the loader guards): any C++ exception escaping
+// here lands in std::terminate and takes the game down. Shield everything.
+struct CallbackShield {
+    const char* what;
+    bool fired = false;
+    explicit CallbackShield(const char* w) : what(w) {}
+    ~CallbackShield() {
+        if (fired)
+            mods::log::error("lumen: exception swallowed in {}", what);
+    }
+};
+
 void on_scene_begin(ModContext*, const GfxStageContext* stage, void*) {
-    g_camera_valid = stage->game_view &&
-                     svc_camera->get_camera(mod_ctx, stage->game_view, &g_camera) == MOD_OK;
+    CallbackShield shield {"scene-begin hook"};
+    try {
+        g_camera_valid = stage->game_view &&
+                         svc_camera->get_camera(mod_ctx, stage->game_view, &g_camera) == MOD_OK;
+    } catch (...) {
+        shield.fired = true;
+    }
 }
 
 void on_frame_before_hud(ModContext*, const GfxStageContext*, void*) {
+    CallbackShield shield {"frame-before-HUD hook"};
+    try {
     // Effects held off for the job: re-assert the pins once per frame so a
     // game-side write can never leak into a tile.
     if (g_job.active)
@@ -1656,6 +1684,8 @@ void on_frame_before_hud(ModContext*, const GfxStageContext*, void*) {
             } else {
                 g_job.probe_w = targets.width;
                 g_job.probe_h = targets.height;
+                mods::log::info("lumen: probe frame {} reads {}x{}", g_job.probe_frames,
+                    targets.width, targets.height);
             }
         } else if (++g_job.probe_frames > 300) {
             abort_job(false);
@@ -1669,6 +1699,9 @@ void on_frame_before_hud(ModContext*, const GfxStageContext*, void*) {
     GfxDeviceInfo info = GFX_DEVICE_INFO_INIT;
     if (svc_gfx->get_device_info(mod_ctx, &info) == MOD_OK && info.device)
         issue_capture(info.device);
+    } catch (...) {
+        shield.fired = true;
+    }
 }
 
 // ---------------------------------------------------------------- game hooks
