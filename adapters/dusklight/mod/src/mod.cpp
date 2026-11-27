@@ -1697,6 +1697,32 @@ void on_frame_before_hud(ModContext*, const GfxStageContext*, void*) {
     // game-side write can never leak into a tile.
     if (g_job.active)
         strip_repin();
+    // Pre-warm the capture machinery on the first quiet photo-mode frame:
+    // compiling the compute pipeline and allocating the ~25 MB staging pair
+    // happen at a calm moment instead of inside the first capture attempt.
+    // Measured 2026-11-26: a JOB capture as the first capture of a session,
+    // while an area was still streaming, coincided with EXCEPTION_ACCESS_
+    // VIOLATION inside amdxc64.dll (the AMD driver's D3D12 path) three
+    // times; a plain capture or a settled scene never did. Cheap insurance.
+    static bool s_prewarm_done = false;
+    if (g_photo.active && !s_prewarm_done) {
+        GfxDeviceInfo pw = GFX_DEVICE_INFO_INIT;
+        GfxResolveDesc rd = GFX_RESOLVE_DESC_INIT;
+        rd.color = true;
+        GfxResolvedTargets rt = GFX_RESOLVED_TARGETS_INIT;
+        if (svc_gfx->get_device_info(mod_ctx, &pw) == MOD_OK && pw.device &&
+            svc_gfx->resolve_pass(mod_ctx, &rd, &rt) == MOD_OK && rt.width && rt.height) {
+            g_gfx_stage = "prewarm";
+            ensure_pipeline(pw.device);
+            if (g_capture.pipeline) {
+                ensure_capture_buffers(pw.device, rt.width * rt.height * 4u);
+                s_prewarm_done = true;
+                mods::log::info("lumen: capture machinery pre-warmed ({}x{})", rt.width,
+                    rt.height);
+            }
+            g_gfx_stage = "idle";
+        }
+    }
     // Gigapixel job kickoff: one probe of the scene color size before aiming
     // tiles (the master grid is defined in viewport-sized cells).
     if (g_job.active && g_job.build_pending) {

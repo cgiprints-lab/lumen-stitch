@@ -36,10 +36,25 @@ build/core/lumen status
 build/core/lumen install --adapter dusklight --artifact build/dusklight-mod/mods/lumen_photo.dusk
 build/core/lumen uninstall --adapter dusklight
 
-# stitch a gigapixel job captured in-game (F9 photo mode, F11 gigapixel):
-# tiles + manifest land in the capture folder; stitch offline:
+# stitch a gigapixel job captured in-game: tiles, manifest, and the stitched
+# BigTIFF + previews land in the capture folder automatically
+# (Pictures/Lumen by default); offline re-stitch of any job:
 build/core/lumen stitch "path/to/capture-folder/lumen-<id>.json" --out panorama.tiff
 ```
+
+In-game hotkeys (photo mode off = plain game, every game key untouched):
+
+| Key           | Action                                            |
+|---------------|---------------------------------------------------|
+| F1            | enter/exit photo mode (free camera + time freeze)  |
+| F7            | single screenshot (HUD-free)                       |
+| Shift+F7      | stereo trio -> side-by-side image                  |
+| F12           | gigapixel super-resolution (default 8x8 tiles)     |
+| Shift+F12     | 360 panorama (six faces -> equirectangular)        |
+| Alt+F12       | gigapixel variant that can't collide with Steam    |
+
+F2-F6 and F8-F11 stay the game's own keys (F11 is Dusklight's fullscreen
+toggle). WASD + arrow keys fly the camera; mouse look stays available.
 
 Dusklight mod dirs used by the installer:
 
@@ -57,9 +72,8 @@ restart.
 - **M0** (done): manager CLI (status/install/uninstall), adapter manifest, mod
   skeleton (in-game mod panel, session toggle toast, settings persistence).
 - **M1** (done): time freeze, free camera (camera operator), HUD-free 1x
-  capture (F9/F10, WASD/QE flight).
-- **M2** (done, pending in-game run with a CI artifact): gigapixel capture —
-  F11 renders an S×S grid of projection-offset sub-frustums at one frozen eye
+  capture (F7, WASD/arrow flight).
+- **M2** (done): gigapixel capture — F12 renders an S×S grid of projection-offset sub-frustums at one frozen eye
   (2–33 tiles per side, capped so the master image stays within 65536 px per
   side), tiles stream to the capture folder with a JSON manifest;
   `lumen stitch` composites them strip-by-strip into a tiled
@@ -68,7 +82,7 @@ restart.
   (`common/tilemath.h`) is exercised by `stitcher/test/seam_test.cpp`
   (FOV=90 seam fidelity vs a reference render, BigTIFF structure, downsample
   fidelity).
-- **M3** (done, pending in-game run with a CI artifact): gigapixel consistency
+- **M3** (done): gigapixel consistency
   — while a job runs, viewport-relative and temporal effects are held off
   (cloud-shadow haze draw skipped; `mDoGph_gInf_c` bloom/fade/motion-blur
   state pinned off, snapshot + restored on job end), each with a panel toggle
@@ -76,10 +90,12 @@ restart.
   in the manifest; Dusklight's scene target is 8-bit RGBA, so HDR/EXR output
   is wired at the manifest level for future adapters but produces no gain on
   this one (documented in the mod log if a float format ever appears).
-- **M4** (done, pending in-game run with a CI artifact): 360 + stereo +
-  hardening — F12 captures six axis-aligned FOV-90 cube faces at the frozen
+- **M4** (done): 360 + stereo +
+  hardening — Shift+F12 captures six axis-aligned cube faces (poles at 87.5°
+  with a 95° vertical FOV so they cover the poles without hitting the
+  lookAt-degenerate axis) at the frozen
   eye (`lumen stitch` composes an equirectangular panorama, `--equire N` sets
-  its width; seams land inside face overlaps); F8 captures a stereo trio
+  its width; seams land inside face overlaps); Shift+F7 captures a stereo trio
   (left/center/right eyes shifted along the camera right axis, panel-adjustable
   separation; stitched 1:1 side-by-side — translated eyes make resampling
   wrong, so the paste is exact and per-eye `eye` offsets ride the manifest for
@@ -97,6 +113,13 @@ restart.
   floor, and the acceptance checklist; `adapters/_template/` carries the
   copyable skeleton (manifest, integration outline, CMake shape). The
   stitcher and manager need zero changes for a conformant new game.
+- **M6** (done): end-to-end in one keypress — completed capture jobs are
+  stitched **in-mod** on a background worker (exception-proofed, one retry
+  under memory pressure, graceful "parts saved" toast on failure; `lumen
+  stitch <manifest>` recovers any interrupted job); discoverability (entry
+  toast, in-mode cheat sheet, error toasts for every rejected job); color
+  readback matched against the live display; 360 poles kept off the lookAt
+  degenerate axis; camera pose restored exactly on exit.
 
 See `docs/adapter-contract.md` for how to add a new game.
 
@@ -113,3 +136,6 @@ See `docs/adapter-contract.md` for how to add a new game.
   projection-offset super resolution, the FOV=90 panorama alignment test).
 - Dusklight is CC0-1.0. Lumen ships no game assets; users provide their own
   game dump.
+- **Lumen itself is CC0-1.0** (see `LICENSE`): the manager, stitcher, adapter
+  and mod are public domain — free to modify, recompile and redistribute,
+  with no attribution required.
