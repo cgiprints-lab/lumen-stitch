@@ -1585,11 +1585,18 @@ void issue_capture(WGPUDevice device) {
         fail_capture("Capture failed: compute task rejected.");
         return;
     }
-    mods::log::info("lumen: capture issued {} ({}x{}, job={})", g_capture.name.data(), w, h,
+    g_gfx_stage = "capture_issued_log";
+    // Safety: fmt THROWS ("string pointer is null") on a null char* - a bare
+    // F7 capture carries an empty name vector, and this callback runs
+    // unguarded in the game's frame loop (measured 2026-11-26: that throw
+    // killed the game pre-shield and spun the hook forever after).
+    mods::log::info("lumen: capture issued {} ({}x{}, job={})",
+        g_capture.name.empty() ? "(auto)" : g_capture.name.data(), w, h,
         g_capture.for_job ? 1 : 0);
     g_capture.width = w;
     g_capture.height = h;
     g_capture.phase = CAPTURE_WAIT_COPY;
+    g_gfx_stage = "idle";
 }
 
 // ---------------------------------------------------------------- png sink
@@ -1725,6 +1732,17 @@ void on_frame_before_hud(ModContext*, const GfxStageContext*, void*) {
     if (svc_gfx->get_device_info(mod_ctx, &info) == MOD_OK && info.device)
         issue_capture(info.device);
     LUMEN_SHIELD_CATCH(shield)
+    if (shield.fired && (g_capture.phase != CAPTURE_NONE || g_job.active)) {
+        // A throw mid-capture leaves the phase machine spinning: the same
+        // failure will repeat every frame. After 20 strikes, cancel the
+        // capture (and its job) instead of livelocking the frame hook.
+        static int s_throw_streak = 0;
+        if (++s_throw_streak >= 20) {
+            s_throw_streak = 0;
+            fail_capture("Capture failed: the graphics layer kept rejecting the "
+                         "readback (see the mod log for the error).");
+        }
+    }
 }
 
 // ---------------------------------------------------------------- game hooks
