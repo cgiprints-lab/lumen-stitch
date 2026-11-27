@@ -54,9 +54,11 @@
 
 #include <cinttypes>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <new>
@@ -300,6 +302,8 @@ ConfigVarHandle g_var_stereo_ipd = 0;
 ConfigVarHandle g_var_photo_fov = 0;
 ConfigVarHandle g_var_capture_folder = 0;
 ConfigVarHandle g_var_strip_haze = 0;
+ConfigVarHandle g_var_essentials_hint = 0;
+bool g_compat_hinted = false;
 ConfigVarHandle g_var_auto_stitch = 0;
 ConfigVarHandle g_var_freeze_world = 0;
 ConfigVarHandle g_var_swap_rb = 0;
@@ -832,7 +836,7 @@ void start_auto_stitch(uint64_t job_id) {
 ModResult begin_capture(const char* name_override, bool for_job) {
     if (g_capture.phase != CAPTURE_NONE)
         return MOD_OK; // one shot at a time
-    g_capture.settle_left = static_cast<int>(cfg_int(g_var_settle_frames, 2));
+    g_capture.settle_left = static_cast<int>(cfg_int(g_var_settle_frames, 4));
     g_capture.stall_frames = 0;
     g_capture.for_job = for_job;
     g_capture.name.clear();
@@ -914,6 +918,54 @@ bool job_startable() {
 }
 
 // Shared kickoff: everything is decided after the viewport-size probe.
+// Third-party interop: Twilit Essentials (com.dusklight.twilit_essentials)
+// adds effects that ANIMATE EVERY RENDER FRAME and keep frame history - Wind
+// on foliage/cloth, 3D grass geometry, volumetric clouds + cloud shadows,
+// and Color & Lens film grain / chromatic aberration / vignette (their own
+// WGSL + temporal caches). No actor pause can stop them: their time source
+// is the render frame itself. Lumen cannot pause another mod, but it can
+// detect the package next to ours and say so once, so the user knows which
+// toggles make multi-tile jobs seamless.
+bool twilit_essentials_present() {
+    static int cached = -1;
+    if (cached >= 0)
+        return cached == 1;
+    std::vector<std::string> roots;
+#ifdef _WIN32
+    if (const char* appdata = std::getenv("APPDATA"))
+        roots.push_back(std::string(appdata) + "\\TwilitRealm\\Dusklight\\mods");
+#else
+    const char* home = std::getenv("HOME");
+    if (home) {
+#ifdef __APPLE__
+        roots.push_back(std::string(home) + "/Library/Application Support/TwilitRealm/Dusklight/mods");
+#else
+        roots.push_back(std::string(home) + "/.local/share/TwilitRealm/Dusklight/mods");
+#endif
+    }
+#endif
+    bool found = false;
+    for (const std::string& dir : roots) {
+        std::error_code ec;
+        for (const auto& de : std::filesystem::directory_iterator(dir, ec)) {
+            std::string n = de.path().filename().string();
+            for (char& c : n)
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if (n.find("twilit_essentials") != std::string::npos) {
+                found = true;
+                break;
+            }
+        }
+        if (found)
+            break;
+    }
+    cached = found ? 1 : 0;
+    if (found)
+        mods::log::info("lumen: Twilit Essentials detected - per-frame effects will differ "
+                        "between tiles unless disabled in its Graphics menu");
+    return found;
+}
+
 void begin_job(JobState::Kind kind, uint32_t S) {
     g_job.active = true;
     g_job.build_pending = true; // need the scene color size before aiming tiles
@@ -930,6 +982,15 @@ void begin_job(JobState::Kind kind, uint32_t S) {
             std::chrono::system_clock::now().time_since_epoch())
             .count());
     strip_begin(); // hold screen-space/temporal effects off for the whole job
+    // One-time heads-up when a per-frame-animated companion mod is present.
+    if (kind != JobState::STEREO && !g_compat_hinted &&
+        cfg_bool(g_var_essentials_hint, true) && twilit_essentials_present()) {
+        g_compat_hinted = true;
+        push_photo_toast("Lumen Photo Mode",
+            "Twilit Essentials detected: Wind, 3D Grass, Clouds and Color & Lens animate "
+            "every frame, so tiles will differ at the seams. Turn them off in the "
+            "Essentials Graphics menu for seamless gigapixel/360 shots.", "warning");
+    }
 }
 
 void start_gigapixel() {
@@ -2013,6 +2074,22 @@ ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
     {
         UiControlDesc ctl = UI_CONTROL_DESC_INIT;
         ctl.kind = UI_CONTROL_TOGGLE;
+        ctl.label = "Companion-mod hint (Twilit Essentials)";
+        ctl.help_rml = "Once per game session, when a multi-tile job starts and "
+                       "Twilit Essentials is installed, Lumen reminds you that its Wind, "
+                       "3D Grass, volumetric Clouds and Color & Lens effects animate on "
+                       "every render frame and keep frame history - actor freeze cannot "
+                       "stop them, so their toggles must be turned off in the Essentials "
+                       "Graphics menu for perfectly seamless gigapixel/360 images. "
+                       "Turn this off if the reminder bothers you.";
+        ctl.binding = UI_BINDING_CONFIG_VAR;
+        ctl.config_var = g_var_essentials_hint;
+        svc_ui->pane_add_control(mod_ctx, panel, &ctl, nullptr);
+    }
+
+    {
+        UiControlDesc ctl = UI_CONTROL_DESC_INIT;
+        ctl.kind = UI_CONTROL_TOGGLE;
         ctl.label = "Swap red and blue in captures";
         ctl.help_rml = "Only for graphics backends that read the scene buffer's red and blue "
                        "reversed. Off is correct on Dusklight 2.0.3: captures were measured to "
@@ -2063,7 +2140,7 @@ extern "C" {
 
 MOD_EXPORT ModResult mod_initialize(ModError* error) {
     g_var_capture_scale = register_var_typed("captureScale", CONFIG_VAR_INT, 4, 0);
-    g_var_settle_frames = register_var_typed("settleFrames", CONFIG_VAR_INT, 2, 0);
+    g_var_settle_frames = register_var_typed("settleFrames", CONFIG_VAR_INT, 4, 0);
     // NUMBER controls bind INT vars only (the UI service type-checks the
     // binding: CONFIG_VAR_FLOAT is rejected with "type does not match the
     // control kind"), so the flight/look/FOV settings are ints. stereoIpd is
@@ -2081,6 +2158,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     g_var_strip_bloom = register_var_typed("stripBloom", CONFIG_VAR_BOOL, 0, 0);
     g_var_strip_fade = register_var_typed("stripFade", CONFIG_VAR_BOOL, 0, 0);
     g_var_strip_blur = register_var_typed("stripBlur", CONFIG_VAR_BOOL, 1, 0);
+    g_var_essentials_hint = register_var_typed("essentialsHint", CONFIG_VAR_BOOL, 1, 0);
     g_var_auto_stitch = register_var_typed("autoStitch", CONFIG_VAR_BOOL, 1, 0);
     g_var_freeze_world = register_var_typed("freezeWorld", CONFIG_VAR_BOOL, 1, 0);
     g_var_swap_rb = register_var_typed("swapRB", CONFIG_VAR_BOOL, 0, 0);

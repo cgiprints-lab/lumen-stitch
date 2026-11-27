@@ -123,6 +123,29 @@ restart.
 
 See `docs/adapter-contract.md` for how to add a new game.
 
+## Compatibility with other mods
+
+Lumen never modifies the game and shares no state with other mods, so it
+coexists with them. One honest caveat, because effects outside Lumen's own
+consistency layer are not frozen by the game's actor freeze:
+
+- **Twilit Essentials** (Fimmel): its Graphics features — **Wind** (grass,
+  flowers, trees, cloth), **3D Grass** geometry, **volumetric Clouds** with
+  cloud shadows, and **Color & Lens** post effects (film grain, chromatic
+  aberration, vignette) — animate on every *render* frame, and several use
+  frame-history (TAA-style) caches. Dusklight's actor pause — the same
+  freeze Lumen uses — cannot stop them, so their look differs tile-to-tile
+  and their temporal caches bleed the previous view into the next: soft
+  haze and seams across tile borders. Turn those Essentials toggles off
+  (Essentials → Graphics) for perfectly seamless gigapixel/360 images.
+  Lumen detects the package and reminds you once per session (config
+  `essentialsHint`, also in the Lumen panel). Lumen's own "Gigapixel
+  consistency" toggles (cloud-shadow haze / bloom / fade, and motion blur
+  which is on by default because it ghosts the previous tile) cover the
+  base game's screen-space effects.
+- Essentials' own Photo Mode (camera + DoF/filters) should stay off while
+  Lumen photo mode is active — one camera operator should own the view.
+
 ## Notes
 
 - **Toolchains**: MSVC (CI matrix) and clang-cl are the supported Windows
