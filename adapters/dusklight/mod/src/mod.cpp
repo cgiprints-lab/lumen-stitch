@@ -539,7 +539,41 @@ void on_show_controls_pressed(ModContext*, void*) {
 
 // ---------------------------------------------------------------- camera operator
 
+// Which graphics-service call we are inside when something throws: the
+// loader's own Dawn wrapper is the prime suspect and this names it.
+static const char* g_gfx_stage = "idle";
+
+// The game calls stage hooks and the camera operator WITHOUT a try/catch
+// (unlike mod_update, which the loader guards): any C++ exception escaping
+// here lands in std::terminate and takes the game down. Shield everything.
+struct CallbackShield {
+    const char* what;
+    bool fired = false;
+    std::string message;
+    explicit CallbackShield(const char* w) : what(w) {}
+    ~CallbackShield() {
+        if (fired)
+            mods::log::error("lumen: exception swallowed in {}: {} [gfx stage: {}]", what,
+                message, g_gfx_stage);
+    }
+};
+
+// Thunks the game runs raw (hooks/operators) must never let a throw escape.
+#define LUMEN_SHIELD_TRY try {
+#define LUMEN_SHIELD_CATCH(shield)                                                       \
+    }                                                                                    \
+    catch (const std::exception& e) {                                                    \
+        (shield).fired = true;                                                           \
+        (shield).message = e.what();                                                     \
+    }                                                                                    \
+    catch (...) {                                                                        \
+        (shield).fired = true;                                                           \
+        (shield).message = "non-standard";                                               \
+    }
+
 bool photo_operate(ModContext*, CameraOperatorState* state, void*) {
+    CallbackShield shield {"camera operator"};
+    LUMEN_SHIELD_TRY
     if (!g_photo.active) {
         // Hand the pristine pose back for a few frames so the game's camera
         // systems resume from where they were, not from the photo pose.
@@ -593,6 +627,8 @@ bool photo_operate(ModContext*, CameraOperatorState* state, void*) {
     state->fovy = g_photo.fov_override > 0.0f ? g_photo.fov_override : g_photo.fovy;
     state->bank_degrees = 0;
     return true;
+    LUMEN_SHIELD_CATCH(shield)
+    return false;
 }
 
 CameraOperatorHandle g_operator = 0;
@@ -1494,6 +1530,7 @@ void issue_capture(WGPUDevice device) {
     GfxResolveDesc resolveDesc = GFX_RESOLVE_DESC_INIT;
     resolveDesc.color = true;
     GfxResolvedTargets targets = GFX_RESOLVED_TARGETS_INIT;
+    g_gfx_stage = "resolve_pass";
     if (svc_gfx->resolve_pass(mod_ctx, &resolveDesc, &targets) != MOD_OK || !targets.color) {
         fail_capture("Capture failed: no scene color snapshot.");
         return;
@@ -1518,6 +1555,7 @@ void issue_capture(WGPUDevice device) {
         return;
     }
 
+    g_gfx_stage = "create_buffers";
     if (!ensure_capture_buffers(device, bytes)) {
         fail_capture("Capture failed: buffer allocation failed.");
         return;
@@ -1534,6 +1572,7 @@ void issue_capture(WGPUDevice device) {
     const uint32_t swap_rb = cfg_bool(g_var_swap_rb, false) ? 1u : 0u;
     const uint32_t dims[4] = {w, h, swap_rb, 0};
     GfxRange uniformRange = {};
+    g_gfx_stage = "push_uniform";
     if (svc_gfx->push_uniform(mod_ctx, dims, sizeof(dims), &uniformRange) != MOD_OK) {
         fail_capture("Capture failed: uniform stream rejected.");
         return;
@@ -1541,6 +1580,7 @@ void issue_capture(WGPUDevice device) {
 
     ReadbackPayload payload{targets.color, g_capture.storage, g_capture.staging, bytes,
         uniformRange.offset, w, h};
+    g_gfx_stage = "push_compute";
     if (svc_gfx->push_compute(mod_ctx, g_compute_type, &payload, sizeof(payload)) != MOD_OK) {
         fail_capture("Capture failed: compute task rejected.");
         return;
@@ -1635,32 +1675,17 @@ void finish_capture_file() {
 
 // ---------------------------------------------------------------- gfx stage hooks
 
-// The game calls stage hooks and the camera operator WITHOUT a try/catch
-// (unlike mod_update, which the loader guards): any C++ exception escaping
-// here lands in std::terminate and takes the game down. Shield everything.
-struct CallbackShield {
-    const char* what;
-    bool fired = false;
-    explicit CallbackShield(const char* w) : what(w) {}
-    ~CallbackShield() {
-        if (fired)
-            mods::log::error("lumen: exception swallowed in {}", what);
-    }
-};
-
 void on_scene_begin(ModContext*, const GfxStageContext* stage, void*) {
     CallbackShield shield {"scene-begin hook"};
-    try {
+    LUMEN_SHIELD_TRY
         g_camera_valid = stage->game_view &&
                          svc_camera->get_camera(mod_ctx, stage->game_view, &g_camera) == MOD_OK;
-    } catch (...) {
-        shield.fired = true;
-    }
+    LUMEN_SHIELD_CATCH(shield)
 }
 
 void on_frame_before_hud(ModContext*, const GfxStageContext*, void*) {
     CallbackShield shield {"frame-before-HUD hook"};
-    try {
+    LUMEN_SHIELD_TRY
     // Effects held off for the job: re-assert the pins once per frame so a
     // game-side write can never leak into a tile.
     if (g_job.active)
@@ -1699,9 +1724,7 @@ void on_frame_before_hud(ModContext*, const GfxStageContext*, void*) {
     GfxDeviceInfo info = GFX_DEVICE_INFO_INIT;
     if (svc_gfx->get_device_info(mod_ctx, &info) == MOD_OK && info.device)
         issue_capture(info.device);
-    } catch (...) {
-        shield.fired = true;
-    }
+    LUMEN_SHIELD_CATCH(shield)
 }
 
 // ---------------------------------------------------------------- game hooks
