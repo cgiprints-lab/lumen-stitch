@@ -987,9 +987,9 @@ void begin_job(JobState::Kind kind, uint32_t S) {
         cfg_bool(g_var_essentials_hint, true) && twilit_essentials_present()) {
         g_compat_hinted = true;
         push_photo_toast("Lumen Photo Mode",
-            "Twilit Essentials detected: Wind, 3D Grass, Clouds and Color & Lens animate "
-            "every frame, so tiles will differ at the seams. Turn them off in the "
-            "Essentials Graphics menu for seamless gigapixel/360 shots.", "warning");
+            "Twilit Essentials detected: close its Photo Mode (its haze, filters and "
+            "letterbox bake into every tile), and turn off Wind / 3D Grass / Clouds in "
+            "its Graphics menu - they animate every frame, so tiles seam.", "warning");
     }
 }
 

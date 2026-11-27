@@ -138,6 +138,10 @@ consistency layer are not frozen by the game's actor freeze:
   and their temporal caches bleed the previous view into the next: soft
   haze and seams across tile borders. Turn those Essentials toggles off
   (Essentials → Graphics) for perfectly seamless gigapixel/360 images.
+  Close **Essentials' own Photo Mode** too while Lumen's is open: its
+  atmosphere haze, filters, film grain and letterbox overlays render into
+  every tile and differ tile-to-tile (its photos save to
+  `Pictures/Twilit Essentials`, completely separate from Lumen's).
   Lumen detects the package and reminds you once per session (config
   `essentialsHint`, also in the Lumen panel). Lumen's own "Gigapixel
   consistency" toggles (cloud-shadow haze / bloom / fade, and motion blur
