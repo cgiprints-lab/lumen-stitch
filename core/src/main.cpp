@@ -63,8 +63,14 @@ void print_status(const Adapter& a) {
     std::cout << "adapter " << a.id << " (" << a.name << ")\n";
     if (installs.empty()) {
         std::cout << "  no install detected (looked in:";
-        for (const auto& t : a.data_dir_tokens)
-            std::cout << " " << t;
+        if (a.layouts.empty()) {
+            for (const auto& t : a.data_dir_tokens)
+                std::cout << " " << t;
+        } else {
+            for (const auto& l : a.layouts)
+                for (const auto& t : l.dir_tokens)
+                    std::cout << " " << t;
+        }
         std::cout << ")\n";
         return;
     }
@@ -72,6 +78,7 @@ void print_status(const Adapter& a) {
         std::error_code ec;
         bool present = std::filesystem::exists(in.bundle_path(a), ec);
         std::cout << "  install: " << in.data_dir.string() << "\n";
+        std::cout << "    mods go in: " << in.mod_dir.string() << "\n";
         std::cout << "    integration (" << a.bundle << "): " << exists_text(present);
         if (present) {
             std::error_code dir_ec;

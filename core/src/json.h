@@ -28,6 +28,7 @@ struct JsonValue {
     bool is_object() const { return kind == Kind::Object; }
     bool is_array() const { return kind == Kind::Array; }
     bool is_string() const { return kind == Kind::String; }
+    bool is_bool() const { return kind == Kind::Bool; }
 
     const JsonValue* find(std::string_view key) const {
         auto it = object.find(std::string(key));

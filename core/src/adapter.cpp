@@ -44,6 +44,30 @@ std::optional<Adapter> Adapter::load(const std::filesystem::path& dir, std::stri
             for (const auto& m : v->array)
                 if (m.is_string())
                     a.markers.push_back(m.string);
+        // layouts: several folder shapes one adapter can live in.
+        if (auto ls = det->find("layouts"); ls && ls->is_array()) {
+            for (const auto& l : ls->array) {
+                if (!l.is_object())
+                    continue;
+                DetectLayout lay;
+                if (auto dirs = l.find("dirs"); dirs && dirs->is_array())
+                    for (const auto& d : dirs->array)
+                        if (d.is_string())
+                            lay.dir_tokens.push_back(d.string);
+                if (auto ms = l.find("markers"); ms && ms->is_array())
+                    for (const auto& m : ms->array)
+                        if (m.is_string())
+                            lay.markers.push_back(m.string);
+                if (auto v = l.find("markers_all"); v && v->is_bool())
+                    lay.markers_all = v->boolean;
+                if (auto v = l.find("mod_subdir"); v && v->is_string())
+                    lay.mod_subdir = v->string;
+                if (auto v = l.find("scan_subdirs"); v && v->is_bool())
+                    lay.scan_subdirs = v->boolean;
+                if (!lay.dir_tokens.empty())
+                    a.layouts.push_back(std::move(lay));
+            }
+        }
     }
     if (auto integ = root.find("integration"); integ && integ->is_object()) {
         if (auto v = integ->find("mod_id"); v && v->is_string())

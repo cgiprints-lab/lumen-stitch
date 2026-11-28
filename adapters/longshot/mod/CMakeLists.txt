@@ -22,8 +22,11 @@ file(GLOB_RECURSE LUMEN_MOD_SOURCES RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}"
 # A generated script does the staging at build time, with absolute paths
 # baked in at configure: `cmake --build` after an edit re-syncs the listed
 # sources without reconfiguring, and nothing outside them ever moves.
+# The bundle is emptied first, so it is an exact mirror of the list - stale
+# leftovers (an earlier copy-based staging run's tree) must never ride into
+# an install, where they would nest one level deeper every time.
 set(sync_script "${CMAKE_BINARY_DIR}/lumen_bundle_sync.cmake")
-set(sync_body "")
+set(sync_body "file(REMOVE_RECURSE \"${BUNDLE_DIR}\")\n")
 foreach(entry IN LISTS LUMEN_MOD_SOURCES)
     string(APPEND sync_body
         "get_filename_component(d \"${BUNDLE_DIR}/${entry}\" DIRECTORY)\n"

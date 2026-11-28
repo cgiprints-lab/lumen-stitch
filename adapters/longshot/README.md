@@ -18,11 +18,22 @@ From a Lumen checkout, with the manager built:
 lumen install --adapter longshot --build
 ```
 
-The manager detects the game folder (the folder with `image.bin`; by default
-`%USERPROFILE%\Games\Longshot` on Windows, `~/Games/Longshot` on Linux) and
-copies the bundle folder into that profile's `mods/` (`<game>/profile/mods/`).
-If you play through **RecompLauncher** (`%APPDATA%\Longshot`), copy the built
-`mods/lumen-photo` folder into that profile's `mods/` yourself.
+The manager tries the layouts Longshot actually uses, newest first
+(`adapter.json`'s `detection.layouts`, verified against a real install):
+
+1. **the Rust builder line** (Longshot #2286, nightly-895+): one profile
+   folder per player under `%LOCALAPPDATA%\Longshot\data\profiles\<name>`
+   (`profile.json` + its `mods/`) — a portable launcher keeps the same shape
+   under its own `Longshot/data/profiles`.
+2. **older standalone game folders** (`image.bin` and `longshot_options.ini`
+   beside each other, e.g. `%USERPROFILE%\Games\Longshot`): mods go in
+   `<game>/profile/mods/`.
+3. **RecompLauncher's per-user place** (`%APPDATA%\Longshot`).
+
+`lumen status --adapter longshot` prints which install it found and where
+mods go. A game folder built by the new builder (`<version>/builds/default`)
+holds no `mods/` of its own: its mods live in the profile, which is why the
+profile is what gets detected.
 
 Then **restart the game** (Longshot indexes mods only at start), turn
 **Lumen Photo Suite** on in the Insert menu's Mods tab, and accept its code
@@ -73,6 +84,11 @@ Stitching is the shared Lumen stitcher, zero game-specific flags:
 lumen stitch "<game folder>/captures/lumen/lumen-<id>.json" --out photo.tiff
 ```
 
+(The game folder is `<version>/builds/default` under
+`%LOCALAPPDATA%\Longshot\data\versions\` on the Rust-builder line, the folder
+holding `image.bin` on the older one; the capture folder itself is part of
+the capture-seam proposal in [seams.md](seams.md).)
+
 The gigapixel output is a tiled BigTIFF with a SubIFD mip chain (gigapixel
 viewing); cube jobs re-project to an equirectangular panorama (`--equire`),
 stereo pastes side-by-side.
@@ -121,13 +137,15 @@ consumed, job cycling, plan-only capture without the seam) - see
   Mod API line: its docs live on the `mod-api` branch and its Rust game-side
   implementation is PR **#2434** (`feat/game-rs`, WIP, rebased on the new Rust
   builder as of 2026-11-28). No public release carries it yet — verified on a
-  real install: stable v3.2.0's binary has no Modding API markers, and
-  nightly-895's new builder answers `Longshot.exe mod import` but stubs the
-  code-mod tools (`mod check/test/run`: "the Mod API fills this", exit 125).
-  Until a #2434-based build ships, this mod is not loadable in-game; the
-  adapter documents that in its manifest's `versions`. The manifest and
-  sources track #2434's `docs/modding` (api-schema, reference, the upstream
-  `photo-mode` example) exactly, so it is ready for that host.
+  real install (2026-11-28): stable v3.2.0's binary has no Modding API
+  markers; nightly-895's Rust builder reports `mod` among the *builder's*
+  capabilities but every subcommand answers "mod tooling not built in to this
+  builder" (exit 125), and its `info` lists the game's capabilities without
+  any mod-API entry. Until a #2434-based build ships, this mod is not
+  loadable in-game; the adapter documents that in its manifest's `versions`.
+  The manifest and sources track #2434's `docs/modding` (api-schema,
+  reference, the upstream `photo-mode` example) exactly, so it is ready for
+  that host.
 - Longshot's overlays (CRT filter, colour-vision, HDR tone-map curve, FPS
   counter) are renderer-side; while the capture seam's `holdScreenEffects()`
   is the designed hold-off, until it lands capture is plan-only anyway, and
