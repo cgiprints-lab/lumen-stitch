@@ -65,7 +65,8 @@ each readback (temporal pipelines), freeze on/off, HUD-hide on/off.
 ## Capture and the capture seam
 
 Capture (reading the scene back to PNG) **is not in the Modding API yet**:
-`game/modapi/schema/gfx.toml` says plainly *"nothing reads its output back"*.
+`docs/modding/gfx.md` says plainly *"nothing reads its output back into a
+script"*, and a mod's own file API is read-only.
 The mod therefore runs in two tiers:
 
 - **Photo mode (works today, API 0.1):** free camera, `game.pause()` freeze

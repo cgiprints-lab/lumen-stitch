@@ -4,8 +4,8 @@ The photo-mode half of this adapter ships entirely inside the Mod API as it
 stands in #2434 (`api = "0.1"`): `camera.override` is the
 free camera and the tile aimer (angles + FOV), `game.pause()` is the freeze,
 `hideGameHud()` is the HUD. **The one missing piece is reading the scene
-back to files.** `game/modapi/schema/gfx.toml` says it plainly: *"nothing
-reads its output back"*, and a mod's own file API is read-only.
+back to files.** `docs/modding/gfx.md` says it plainly: *"nothing reads its
+output back into a script"*, and a mod's own file API is read-only.
 
 This page is the proposal (draft for a Longshot tracking issue): one new
 mod-facing module, `longshot/capture`, host-side by construction. It fits
