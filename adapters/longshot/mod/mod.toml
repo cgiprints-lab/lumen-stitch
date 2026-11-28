@@ -23,7 +23,7 @@ permissions = [
 
 # The photo-mode floor this game must have or the mod stays off (with the
 # reason named in the Mods tab), like the upstream photo-mode example:
-requires = ["camera.state", "camera.override", "input.action", "input.pad.intercept"]
+requires = ["camera.state", "camera.override", "input.action", "input.pad.intercept", "input.pointer.capture"]
 
 # Capture itself (has("capture.frame")) is an optional feature: the mod loads
 # and photo mode works without it; capture degrades to a logged plan.

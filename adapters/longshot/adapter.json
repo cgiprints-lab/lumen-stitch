@@ -18,8 +18,8 @@
   "versions": {
     "verified": [],
     "ci_matrix": [],
-    "built_for": "mod-api (Modding API 0.1; not yet a stable release)",
-    "fallback": "one artifact family (a Longshot mod folder) serves every Longshot release whose Modding API is 0.1: the mod probes has('capture.frame')/has('game.pause')/hideGameHud and degrades per subsystem; the feature floor is photo mode (free camera) with capture logged as a plan until the capture seam lands (see seams.md). NOTE: stable v3.2.0 (main branch, verified 2026-11-28) has no Modding API at all - no longshot/camera marker in its binary, no `Longshot.exe mod` builder; this mod loads only where API 0.1 ships. A mod written for API 0.2 would need its own api pin."
+    "built_for": "Modding API 0.1 as documented on mod-api and implemented in PR #2434 (feat/game-rs, WIP; rebased on the Rust builder as of 2026-11-28)",
+    "fallback": "one artifact family (a Longshot mod folder) serves every Longshot release whose Modding API is 0.1: the mod probes has('capture.frame')/has('game.pause')/hideGameHud and degrades per subsystem; the feature floor is photo mode (free camera) with capture logged as a plan until the capture seam lands (see seams.md). NOTE: no public release carries API 0.1 yet (verified 2026-11-28): stable v3.2.0's binary has no Modding API; nightly-895's Rust builder answers `Longshot.exe mod import` but stubs the code-mod tools (check/test/run exit 125 until the Mod API's crate fills the dispatch). This mod loads only where API 0.1 ships. A mod written for API 0.2 would need its own api pin."
   },
   "artifacts": {
     "windows-x64": "artifacts/windows-x64/lumen-photo",

@@ -22,7 +22,7 @@
 import { has, NotAvailableError } from "longshot";
 import type { CameraOverride, Handle, Subscription, Vec3 } from "longshot";
 import camera from "longshot/camera";
-import game, { after, mapLoading, update } from "longshot/game";
+import game, { mapLoading, update } from "longshot/game";
 import { action, pad, pointer } from "longshot/input";
 import log from "longshot/log";
 import { profile } from "longshot/storage";
@@ -97,8 +97,10 @@ function cfgSpeed(): number { return Math.max(1, Math.min(120, Number(settings.g
 function cfgGridScale(): number { return Math.max(2, Math.min(33, Number(settings.get("gridScale")) || 4)); }
 function cfgIpdM(): number { return Math.max(0.02, Math.min(0.14, (Number(settings.get("stereoIpdCm")) || 6) / 100)); }
 
-function jobId(): string {
-  return `${Math.trunc(after() * 1000)}-${++jobSeq}`;
+function jobId(frame: number): string {
+  // game.after() is a timer, not a clock: the job's stamp rides the game's
+  // frame counter (Frames.frame: frames since the game started).
+  return `f${frame}-${++jobSeq}`;
 }
 
 // The poses the job would shoot from the view's current state.
@@ -119,7 +121,7 @@ function planJob(vw: number, vh: number, id: string): { kind: JobKind; job: JobO
   return { kind: "360", job, poses };
 }
 
-function startCapture(): void {
+function startCapture(frame: number): void {
   if (!mode) {
     log.info("lumen: turn on photo mode first (L3+R3 / F8) - capture shoots from your own camera");
     return;
@@ -129,13 +131,13 @@ function startCapture(): void {
     return;
   }
   probeCapture();
-  const id = jobId();
+  const id = jobId(frame);
   if (!captureApi) {
     // Feature floor without the seam: log the exact plan; stitch it once the
     // seam lands. The plan also rides in profile storage for recovery.
     const { kind, job } = planJob(1280, 720, id);   // viewport unknown here: assumed, flagged
     if (job) {
-      profile.set("lastPlan", JSON.stringify(job));
+      profile.set("lastPlan", job);   // stores take structured values: no JSON string needed
       log.info(`lumen: plan ${kind} ${job.tiles.length} tiles from fov ${mode.fov.toFixed(1)}deg `
              + `(viewport assumed 1280x720) - no capture seam in this build, nothing written`);
     } else
@@ -325,11 +327,11 @@ function leave(): void {
 }
 
 const actPhoto = action("photo");
-const actCapture = action("capture");
-const actJob = action("job");
+const actCapture = action("capture", { consume: true });   // ZR/F6 never reaches Link either
+const actJob = action("job", { consume: true });
 actPhoto.pressed.on(() => (mode ? leave() : enter()));
-actCapture.pressed.on(() => { if (!mode) startCapture(); });   // inside photo mode the intercept's A drives it
-actJob.pressed.on(() => { if (!mode) nextJob(); });            // ... and R's chord only cycles from outside
+actCapture.pressed.on((e) => { if (!mode) startCapture(e.frame); });   // inside photo mode the intercept's A drives it
+actJob.pressed.on(() => { if (!mode) nextJob(); });                    // ... and R's chord only cycles from outside
 
 // --- the frame loop -------------------------------------------------------------
 
@@ -364,7 +366,7 @@ update.on((f) => {
     const n = mode.padNow, w = mode.padWas;
     if (n.dpadRight && !w.dpadRight) nextJob();
     if (n.dpadLeft && !w.dpadLeft) prevJob();
-    if (n.a && !w.a) startCapture();
+    if (n.a && !w.a) startCapture(game.state()?.frame ?? 0);
     if (n.b && !w.b && run) cancelRun("player");
     w.a = n.a; w.b = n.b; w.dpadRight = n.dpadRight; w.dpadLeft = n.dpadLeft;
     mode.view.setPosition(mode.eye);

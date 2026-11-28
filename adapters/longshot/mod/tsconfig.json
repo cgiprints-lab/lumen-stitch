@@ -1,0 +1,23 @@
+{
+  // Checked by `Longshot.exe mod check --types` (TypeScript 7's tsgo, noEmit):
+  // the game itself compiles src/ as ES modules at ES2023 while loading it.
+  // The API's types live in types/, written by `Longshot.exe mod types`
+  // (run again after a Longshot update). Matches the upstream template.
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "module": "ESNext",
+    "moduleDetection": "force",
+    "moduleResolution": "Bundler",      // imports name a file as it is: ./x.ts
+    "allowImportingTsExtensions": true, // (with noEmit, below)
+    "jsx": "react-jsx",
+    "jsxImportSource": "longshot/ui",
+    "types": [],
+    "strict": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "resolveJsonModule": true,
+    "noEmit": true
+  },
+  "include": ["src", "test", "types"]
+}

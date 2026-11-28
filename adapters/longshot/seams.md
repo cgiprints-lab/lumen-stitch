@@ -12,6 +12,15 @@ mod-facing module, `longshot/capture`, host-side by construction. It fits
 precedents that already exist in the codebase - the work is exposing them,
 not inventing them.
 
+> **Where it lands (checked 2026-11-28):** the API this rides on is the Mod
+> API of PR **#2434** (the game side and mod API in Rust, WIP, rebased on the
+> new Rust builder): its `api::services` layout (`game/crates/api/src/services/`)
+> and its schema generator are exactly where a `capture` service would sit,
+> beside `input` and `camera`. The capture button's other needs
+> (`camera.override` rigs with `setAngles`, `game.pause`, `hideGameHud`,
+> `pad.intercept`, `pointer.capture`) all exist there today, and
+> `docs/modding/examples/photo-mode` is the pattern this adapter follows.
+
 ## Precedents already in Longshot
 
 | Piece | Where it already lives |

@@ -117,11 +117,17 @@ consumed, job cycling, plan-only capture without the seam) - see
 ## Known limits
 
 - **Modding API availability:** the API this mod targets (`api = "0.1"`, the
-  TS script runtime, `camera.override` / `game.pause` / `hideGameHud`) ships
-  on Longshot's `mod-api` line, not yet in the stable channel — verified:
-  stable v3.2.0's binary carries no Modding API markers and no `mod` builder
-  commands. Until a mod-api-based release lands, this mod is not loadable
-  in-game; the adapter documents that in its manifest's `versions`.
+  TS script runtime, `camera.override` / `game.pause` / `hideGameHud`) is the
+  Mod API line: its docs live on the `mod-api` branch and its Rust game-side
+  implementation is PR **#2434** (`feat/game-rs`, WIP, rebased on the new Rust
+  builder as of 2026-11-28). No public release carries it yet — verified on a
+  real install: stable v3.2.0's binary has no Modding API markers, and
+  nightly-895's new builder answers `Longshot.exe mod import` but stubs the
+  code-mod tools (`mod check/test/run`: "the Mod API fills this", exit 125).
+  Until a #2434-based build ships, this mod is not loadable in-game; the
+  adapter documents that in its manifest's `versions`. The manifest and
+  sources track #2434's `docs/modding` (api-schema, reference, the upstream
+  `photo-mode` example) exactly, so it is ready for that host.
 - Longshot's overlays (CRT filter, colour-vision, HDR tone-map curve, FPS
   counter) are renderer-side; while the capture seam's `holdScreenEffects()`
   is the designed hold-off, until it lands capture is plan-only anyway, and
