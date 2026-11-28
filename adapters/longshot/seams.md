@@ -1,8 +1,8 @@
 # The capture seam: what Lumen needs from Longshot upstream
 
-The photo-mode half of this adapter ships entirely inside today's Modding
-API (`api = "0.1"` on the `mod-api` branch): `camera.override` is the free
-camera and the tile aimer (angles + FOV), `game.pause()` is the freeze,
+The photo-mode half of this adapter ships entirely inside the Mod API as it
+stands in #2434 (`api = "0.1"`): `camera.override` is the
+free camera and the tile aimer (angles + FOV), `game.pause()` is the freeze,
 `hideGameHud()` is the HUD. **The one missing piece is reading the scene
 back to files.** `game/modapi/schema/gfx.toml` says it plainly: *"nothing
 reads its output back"*, and a mod's own file API is read-only.
