@@ -1,0 +1,104 @@
+#:schema https://longshot.magicbean.dev/schemas/mod.schema.json
+# Lumen photo suite for Longshot - Ansel-style capture, driven through the
+# Modding API (docs/modding/camera.md, input.md) plus the capture seam
+# proposed in ../seams.md. The game is never patched: this is a plain mod.
+id = "lumen/longshot-photo"
+name = "Lumen Photo Suite"
+author = "Lumen"
+version = "0.1.0"
+license = "CC0-1.0"
+description = "Free camera, world freeze, HUD-free capture, gigapixel stitch jobs, 360 cube and stereo trio. Pairs with the Lumen Manager: finished jobs stitch to gigapixel BigTIFF with lumen stitch."
+api = "0.1"
+runtime = "js"
+entry = "src/main.ts"
+
+permissions = [
+  "input.read",   # own action keys/chords
+  "input.write",  # the exclusive pad filter while the free camera flies
+  "state.read",   # camera.state()
+  "camera.write", # camera.override, game.pause, hideGameHud
+  "ui.hud",       # the in-mode cheat sheet and toasts
+  "storage",      # the last job's plan, for the log and for recovery
+]
+
+# The photo-mode floor this game must have or the mod stays off (with the
+# reason named in the Mods tab), like the upstream photo-mode example:
+requires = ["camera.state", "camera.override", "input.action", "input.pad.intercept"]
+
+# Capture itself (has("capture.frame")) is an optional feature: the mod loads
+# and photo mode works without it; capture degrades to a logged plan.
+claims = ["camera", "input.pad"]
+multiplayer = "local"
+saves = "shared"
+
+[game]
+builds = ["*"]
+
+[[settings]]
+id = "photo"
+type = "keybind"
+label = "Photo mode on/off"
+default = "F8"
+pad = "ls+rs"
+
+[[settings]]
+id = "capture"
+type = "keybind"
+label = "Take the shot (the job chosen below)"
+default = "F6"
+pad = "zr"
+
+[[settings]]
+id = "job"
+type = "keybind"
+label = "Choose the next job (single / stereo / gigapixel / 360)"
+default = "F5"
+pad = "r"
+
+[[settings]]
+id = "freeze"
+type = "toggle"
+label = "Hold the world still in photo mode"
+default = true
+
+[[settings]]
+id = "hideHud"
+type = "toggle"
+label = "Hide the game's HUD in photo mode"
+default = true
+
+[[settings]]
+id = "speed"
+type = "slider"
+label = "Flight speed (m/s)"
+min = 1
+max = 120
+step = 1
+default = 8
+
+[[settings]]
+id = "gridScale"
+type = "slider"
+label = "Gigapixel tiles per side"
+min = 2
+max = 33
+step = 1
+default = 4
+
+[[settings]]
+id = "stereoIpdCm"
+type = "slider"
+label = "Stereo eye separation (cm)"
+min = 2
+max = 14
+step = 1
+default = 6
+
+[[settings]]
+id = "settleFrames"
+type = "slider"
+label = "Settle frames before each tile (temporal pipelines)"
+min = 1
+max = 10
+step = 1
+default = 4

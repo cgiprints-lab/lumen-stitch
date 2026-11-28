@@ -1,0 +1,28 @@
+{
+  "id": "longshot",
+  "name": "Longshot",
+  "detection": {
+    "data_dirs": [
+      "%USERPROFILE%/Games/Longshot",
+      "~/Games/Longshot"
+    ],
+    "mod_subdir": "profile/mods",
+    "markers": ["image.bin"]
+  },
+  "integration": {
+    "mod_id": "lumen/longshot-photo",
+    "bundle": "lumen-photo",
+    "source_dir": "mod",
+    "cmake_target": "lumen_photo_bundle"
+  },
+  "versions": {
+    "verified": [],
+    "ci_matrix": [],
+    "built_for": "3.2.0",
+    "fallback": "one artifact family (a Longshot mod folder) serves every Longshot release whose Modding API is 0.1: the mod probes has('capture.frame')/has('game.pause')/hideGameHud and degrades per subsystem; the feature floor is photo mode (free camera) with capture listed in the log until the capture seam lands (see seams.md). A mod written for API 0.2 would need its own api pin."
+  },
+  "artifacts": {
+    "windows-x64": "artifacts/windows-x64/lumen-photo",
+    "linux-x64": "artifacts/linux-x64/lumen-photo"
+  }
+}

@@ -73,3 +73,43 @@ jobs:
         with:
           name: lumen_photo-${{ matrix.platform }}
           path: build/mod/mods/*.dusk
+
+  # Longshot adapter: the integration is a folder mod (TypeScript, compiled
+  # by the game at load) - CI stages the bundle and guards the tile-math
+  # equivalence between the mod's TS planner and common/tilemath.h. There is
+  # no native compile and no macOS/Android axis: Longshot ships Windows and
+  # Linux only. `Longshot.exe mod check/test` needs a game dump and stays a
+  # manual (documented) step.
+  mod-longshot:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Stage the mod bundle
+        run: cmake -S adapters/longshot/mod -B build/longshot
+      - name: Build bundle
+        run: cmake --build build/longshot
+      - name: Build tile-math fixture (C++)
+        run: |
+          cmake -S adapters/longshot/tests -B build/longshot-tests
+          cmake --build build/longshot-tests
+      - name: Tile-math equivalence (TS vs C++)
+        run: |
+          node --experimental-strip-types adapters/longshot/tests/equiv_test.ts build/longshot-tests/gen_tiles_cpp || \
+            node adapters/longshot/tests/equiv_test.ts build/longshot-tests/gen_tiles_cpp
+        shell: bash
+        if: matrix.os != 'windows-latest'
+      - name: Tile-math equivalence (Windows)
+        run: |
+          node --experimental-strip-types adapters/longshot/tests/equiv_test.ts build/longshot-tests/gen_tiles_cpp.exe || `
+            node adapters/longshot/tests/equiv_test.ts build/longshot-tests/gen_tiles_cpp.exe
+        shell: pwsh
+        if: matrix.os == 'windows-latest'
+      - name: Upload the mod folder (bundle)
+        uses: actions/upload-artifact@v4
+        with:
+          name: lumen-photo-longshot-${{ matrix.os }}
+          path: build/longshot/mods/lumen-photo

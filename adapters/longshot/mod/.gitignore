@@ -1,0 +1,4 @@
+# Builder output: `Longshot.exe mod types` writes the API typings; the Lumen
+# manager stages bundles under build/.
+types/
+build/

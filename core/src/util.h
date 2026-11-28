@@ -16,6 +16,12 @@ std::filesystem::path lumen_data_dir();
 std::string read_file_string(const std::filesystem::path& path, bool& ok);
 bool write_file_string(const std::filesystem::path& path, const std::string& text);
 
+// Recursively copies a folder (a folder-shaped integration bundle, as games
+// whose mod format is a folder with a manifest expect). Same copy semantics
+// as copy_file's overwrite_existing, over an existing tree.
+void copy_tree(const std::filesystem::path& from, const std::filesystem::path& to,
+               std::error_code& ec);
+
 std::string iso8601_now();
 
 // Append (argv-style) helpers for main().

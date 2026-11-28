@@ -74,8 +74,13 @@ void print_status(const Adapter& a) {
         std::cout << "  install: " << in.data_dir.string() << "\n";
         std::cout << "    integration (" << a.bundle << "): " << exists_text(present);
         if (present) {
-            auto size = std::filesystem::file_size(in.bundle_path(a), ec);
-            std::cout << " (" << size << " bytes)";
+            std::error_code dir_ec;
+            if (std::filesystem::is_directory(in.bundle_path(a), dir_ec))
+                std::cout << " (folder)";
+            else {
+                auto size = std::filesystem::file_size(in.bundle_path(a), ec);
+                std::cout << " (" << size << " bytes)";
+            }
         }
         std::cout << "\n";
         auto records = state_find(a, in);
@@ -170,8 +175,16 @@ int cmd_install(const Adapter& a, int argc, char** argv) {
             backup += ".bak-" + std::to_string(std::time(nullptr));
             std::filesystem::rename(dest, backup, ec);
         }
-        std::filesystem::copy_file(bundle, dest,
-                                   std::filesystem::copy_options::overwrite_existing, ec);
+        // A bundle is one file (a native mod like Dusklight's .dusk) or a whole
+        // folder (games whose mod format is a folder with a manifest, like
+        // Longshot's): the artifact's own kind decides, and both install the
+        // same way - into the install's mod dir under the bundle's name.
+        std::error_code is_dir_ec;
+        if (std::filesystem::is_directory(bundle, is_dir_ec))
+            copy_tree(bundle, dest, ec);
+        else
+            std::filesystem::copy_file(bundle, dest,
+                                       std::filesystem::copy_options::overwrite_existing, ec);
         if (ec) {
             std::cerr << "failed to install to " << dest.string() << ": " << ec.message() << "\n";
             return 1;
@@ -188,8 +201,16 @@ int cmd_uninstall(const Adapter& a, int argc, char** argv) {
     int done = 0;
     for (const auto& in : detect_installs(a)) {
         std::error_code ec;
-        if (std::filesystem::remove(in.bundle_path(a), ec)) {
-            std::cout << "removed " << in.bundle_path(a).string() << "\n";
+        auto bp = in.bundle_path(a);
+        // A folder bundle comes off whole; remove_all counts only what it
+        // actually deleted, so a missing bundle still reads as "not installed".
+        bool removed = std::filesystem::remove(bp, ec) != 0;
+        if (!removed) {
+            auto n = std::filesystem::remove_all(bp, ec);
+            removed = ec || n > 0;
+        }
+        if (removed) {
+            std::cout << "removed " << bp.string() << "\n";
             done++;
         }
         state_remove_install(a, in);

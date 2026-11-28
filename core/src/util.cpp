@@ -90,6 +90,32 @@ bool write_file_string(const std::filesystem::path& path, const std::string& tex
     return static_cast<bool>(out);
 }
 
+void copy_tree(const std::filesystem::path& from, const std::filesystem::path& to,
+               std::error_code& ec) {
+    std::filesystem::create_directories(to, ec);
+    if (ec)
+        return;
+    for (const std::filesystem::directory_entry& e :
+         std::filesystem::recursive_directory_iterator(from, ec)) {
+        if (ec)
+            return;
+        const std::filesystem::path& src = e.path();
+        std::filesystem::path dst = to / std::filesystem::relative(src, from, ec);
+        if (ec)
+            return;
+        if (e.is_directory(ec)) {
+            std::filesystem::create_directories(dst, ec);
+            if (ec)
+                return;
+        } else {
+            std::filesystem::copy_file(src, dst,
+                                       std::filesystem::copy_options::overwrite_existing, ec);
+            if (ec)
+                return;
+        }
+    }
+}
+
 std::string iso8601_now() {
     auto t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
     std::tm tm{};
